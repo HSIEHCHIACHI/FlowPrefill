@@ -59,6 +59,10 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def prefill_only_schedule(self, request: "Request", token_budget: int = None) -> "SchedulerOutput":
+        raise NotImplementedError
+    
+    @abstractmethod
     def get_grammar_bitmask(
         self, scheduler_output: "SchedulerOutput"
     ) -> "GrammarOutput | None":

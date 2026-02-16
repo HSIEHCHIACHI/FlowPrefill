@@ -9,9 +9,9 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from multiprocessing import Process, connection
 from multiprocessing.process import BaseProcess
+from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
-
 import msgspec
 import zmq
 
@@ -32,6 +32,40 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 STARTUP_POLL_PERIOD_MS = 10000
+
+import numpy as np
+# Fitting model for TTFT prediction
+def predict_ttft(num_tokens):
+    global PRED_M
+    return float(PRED_M[num_tokens-1])
+def init_pred_ttfts():
+    if envs.VLLM_PROFILER_PATH is None or \
+        not Path(envs.VLLM_PROFILER_PATH).is_file():
+        logger.info("---------- VLLM_PROFILER_PATH is None ----------")
+        return np.zeros(128*1024, dtype=int)
+    pred_arr = []
+    for i in range(128*1024):
+        pred_arr.append(_predict(i))
+    return pred_arr
+def _predict(num_tokens, chunk=1024*8):
+    pred_arr = np.load(envs.VLLM_PROFILER_PATH)
+    if chunk > len(pred_arr):
+        chunk = 8192
+    if num_tokens == 0:
+        return 0.0
+    if num_tokens <= len(pred_arr):
+        return float(pred_arr[num_tokens-1])
+    full_chunks, remainder = divmod(num_tokens, chunk)
+    total = 0.0
+    if full_chunks:
+        total += full_chunks * (float(pred_arr[chunk - 1]) + 0.01) # 0.01: schedule cost
+    if remainder:
+        total += float(pred_arr[remainder - 1])
+    return total
+def update_pred_M():
+    global PRED_M
+    PRED_M = init_pred_ttfts()
+PRED_M = init_pred_ttfts()
 
 
 class CoreEngineState(Enum):

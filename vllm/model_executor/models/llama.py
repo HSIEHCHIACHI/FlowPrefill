@@ -26,13 +26,13 @@
 
 from collections.abc import Iterable
 from itertools import islice
-from typing import Any
 
 import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from vllm.attention import Attention, AttentionType
+from vllm.attention.backends.abstract import AttentionType
+from vllm.attention.layer import Attention
 from vllm.attention.layers.encoder_only_attention import EncoderOnlyAttention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -67,8 +67,12 @@ from .utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    execution_record,
+    preemption_check,
 )
-
+from vllm.forward_context import get_forward_context, ForwardContext
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 
 class LlamaMLP(nn.Module):
     def __init__(
@@ -107,9 +111,18 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        # ctx = get_forward_context()
+
+        # gateup_proj
+        # execution_record(ctx)
         x, _ = self.gate_up_proj(x)
+        # preemption_check(ctx)
+
+        # down_proj
+        # execution_record(ctx)
         x = self.act_fn(x)
         x, _ = self.down_proj(x)
+        # preemption_check(ctx)
         return x
 
 
@@ -120,8 +133,6 @@ class LlamaAttention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        rope_theta: float = 10000,
-        rope_scaling: dict[str, Any] | None = None,
         max_position_embeddings: int = 8192,
         quant_config: QuantizationConfig | None = None,
         bias: bool = False,
@@ -157,7 +168,6 @@ class LlamaAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
         llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
@@ -186,9 +196,7 @@ class LlamaAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        self._init_rotary_emb(
-            config, rope_scaling=rope_scaling, quant_config=quant_config
-        )
+        self._init_rotary_emb(config, quant_config=quant_config)
 
         sliding_window = None
         if layer_types := getattr(config, "layer_types", None):
@@ -228,7 +236,7 @@ class LlamaAttention(nn.Module):
             attn_type=attn_type,
             prefix=f"{prefix}.attn",
         )
-
+        
     def _get_llama_4_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
         # Llama4 scaling
         scaling = 1 + self.llama_4_scaling_beta * torch.log(
@@ -245,20 +253,33 @@ class LlamaAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # ctx = get_forward_context()
+
+        # qkv_proj
+        # execution_record(ctx)
         qkv, _ = self.qkv_proj(hidden_states)
+        # preemption_check(ctx)
+
+        # attn
+        # execution_record(ctx)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         if self.do_llama_4_scaling:
             attn_scale = self._get_llama_4_attn_scale(positions)
             q = (q * attn_scale).to(q.dtype)
         attn_output = self.attn(q, k, v)
+        # preemption_check(ctx)
+
+        # o_proj
+        # execution_record(ctx)
         output, _ = self.o_proj(attn_output)
+        # preemption_check(ctx)
+
         return output
 
     def _init_rotary_emb(
         self,
         config: LlamaConfig,
-        rope_scaling: dict[str, Any] | None,
         quant_config: QuantizationConfig | None,
     ) -> None:
         is_neox_style = True
@@ -270,8 +291,7 @@ class LlamaAttention(nn.Module):
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=self.max_position_embeddings,
-            base=self.rope_theta,
-            rope_scaling=rope_scaling,
+            rope_parameters=getattr(config, "rope_parameters", None),
             is_neox_style=is_neox_style,
             partial_rotary_factor=self.partial_rotary_factor,
         )
@@ -291,14 +311,6 @@ class LlamaDecoderLayer(nn.Module):
         quant_config = self.get_quant_config(vllm_config)
 
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        if rope_scaling is not None and getattr(
-            config, "original_max_position_embeddings", None
-        ):
-            rope_scaling["original_max_position_embeddings"] = (
-                config.original_max_position_embeddings
-            )
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # Support abacusai/Smaug-72B-v0.1 with attention_bias
         # Support internlm/internlm-7b with bias
@@ -326,8 +338,6 @@ class LlamaDecoderLayer(nn.Module):
             num_kv_heads=getattr(
                 config, "num_key_value_heads", config.num_attention_heads
             ),
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             bias=attention_bias,
@@ -354,18 +364,25 @@ class LlamaDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        ctx: ForwardContext,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # ctx = get_forward_context()
         # Self Attention
+        execution_record(ctx)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        preemption_check(ctx)
 
         # Fully Connected
+        execution_record(ctx)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        preemption_check(ctx)
+
         return hidden_states, residual
 
     def get_quant_config(self, vllm_config: VllmConfig) -> QuantizationConfig | None:
@@ -373,7 +390,17 @@ class LlamaDecoderLayer(nn.Module):
         return vllm_config.quant_config
 
 
-@support_torch_compile
+def llama_model_invariants(
+    input_ids, positions, intermediate_tensors=None, inputs_embeds=None
+):
+    """Shape invariants for Llama model compilation, those are translated to
+    runtime assertions for unbacked dynamic shapes and are compiled away for
+    backed"""
+    if input_ids is not None:
+        torch._check(positions.size()[0] == input_ids.size()[0])
+
+
+@support_torch_compile(shape_invariants=llama_model_invariants)
 class LlamaModel(nn.Module):
     def __init__(
         self,
@@ -386,24 +413,18 @@ class LlamaModel(nn.Module):
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
-        lora_config = vllm_config.lora_config
 
         self.config = config
         self.quant_config = quant_config
-        lora_vocab = (
-            (lora_config.lora_extra_vocab_size * (lora_config.max_loras or 1))
-            if lora_config
-            else 0
-        )
-        self.vocab_size = config.vocab_size + lora_vocab
-        self.org_vocab_size = config.vocab_size
+
+        self.vocab_size = config.vocab_size
+
         if get_pp_group().is_first_rank or (
             config.tie_word_embeddings and get_pp_group().is_last_rank
         ):
             self.embed_tokens = VocabParallelEmbedding(
                 self.vocab_size,
                 config.hidden_size,
-                org_num_embeddings=config.vocab_size,
                 quant_config=quant_config,
             )
         else:
@@ -413,6 +434,7 @@ class LlamaModel(nn.Module):
             lambda prefix: layer_type(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -434,6 +456,8 @@ class LlamaModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        ctx = get_forward_context()
+        # execution_record(ctx) # chunk check
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -448,17 +472,21 @@ class LlamaModel(nn.Module):
         aux_hidden_states = []
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
-        ):
+        ):   
+            # execution_record(ctx) # layer check
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
-            hidden_states, residual = layer(positions, hidden_states, residual)
-
+            hidden_states, residual = layer(
+                positions, hidden_states, residual, ctx)
+            # preemption_check(ctx) # layer check
+            
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        # preemption_check(ctx) # chunk check
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states

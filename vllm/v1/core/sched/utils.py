@@ -54,15 +54,15 @@ def check_stop(
     if request.num_output_tokens < sampling_params.min_tokens:
         return False
 
-    last_token_id = request.output_token_ids[-1]
-    if not sampling_params.ignore_eos and last_token_id == request.eos_token_id:
-        request.status = RequestStatus.FINISHED_STOPPED
-        return True
+    # last_token_id = request.output_token_ids[-1]
+    # if not sampling_params.ignore_eos and last_token_id == request.eos_token_id:
+    #     request.status = RequestStatus.FINISHED_STOPPED
+    #     return True
 
-    if last_token_id in (sampling_params.stop_token_ids or ()):
-        request.status = RequestStatus.FINISHED_STOPPED
-        request.stop_reason = last_token_id
-        return True
+    # if last_token_id in (sampling_params.stop_token_ids or ()):
+    #     request.status = RequestStatus.FINISHED_STOPPED
+    #     request.stop_reason = last_token_id
+    #     return True
     if (
         request.num_tokens >= max_model_len
         or request.num_output_tokens >= request.max_tokens

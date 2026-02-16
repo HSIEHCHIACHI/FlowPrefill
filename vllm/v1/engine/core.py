@@ -55,6 +55,7 @@ from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
     EngineZmqAddresses,
     get_device_indices,
+    predict_ttft,
 )
 from vllm.v1.executor import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -65,13 +66,19 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
 
+import threading
+from vllm.utils.async_utils import make_async
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+import multiprocessing as mp
+import math
+
 logger = init_logger(__name__)
 
 POLLING_TIMEOUT_S = 2.5
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
-
 
 class EngineCore:
     """Inner loop of vLLM's Engine."""
@@ -83,12 +90,18 @@ class EngineCore:
         log_stats: bool,
         executor_fail_callback: Callable | None = None,
     ):
+        dev_ranks = vllm_config.parallel_config.dev_ranks
+        if dev_ranks is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+                [str(i) for i in dev_ranks])
+
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
 
         load_general_plugins()
 
         self.vllm_config = vllm_config
+
         if vllm_config.parallel_config.data_parallel_rank == 0:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -97,6 +110,9 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
+
+        if self.vllm_config.model_config.is_flowprefill:
+            self.init_signals()
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -109,6 +125,7 @@ class EngineCore:
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = self._initialize_kv_caches(
             vllm_config
         )
+        self.kv_cache_config = kv_cache_config
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
@@ -128,6 +145,7 @@ class EngineCore:
         scheduler_block_size = (
             vllm_config.cache_config.block_size
             * vllm_config.parallel_config.decode_context_parallel_size
+            * vllm_config.parallel_config.prefill_context_parallel_size
         )
 
         self.scheduler: SchedulerInterface = Scheduler(
@@ -138,6 +156,7 @@ class EngineCore:
             log_stats=self.log_stats,
             block_size=scheduler_block_size,
         )
+
         self.use_spec_decode = vllm_config.speculative_config is not None
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
@@ -180,7 +199,7 @@ class EngineCore:
             logger.info("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
 
-        self.ec_producer = (
+        self.is_ec_producer = (
             vllm_config.ec_transfer_config is not None
             and vllm_config.ec_transfer_config.is_ec_producer
         )
@@ -197,14 +216,82 @@ class EngineCore:
                 scheduler_block_size, caching_hash_fn
             )
 
-        self.step_fn = (
-            self.step if self.batch_queue is None else self.step_with_batch_queue
-        )
+        # self.step_fn = (
+        #     self.step if self.batch_queue is None else self.step_with_batch_queue
+        # )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
+        # If enable, attach GC debugger after static variable freeze.
+        maybe_attach_gc_debug_callback()
+        self.set_step_fn()
+
+    def init_signals(self):
+        self.tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        self.preempted_signals = {}
+        self.execution_signals = {}
+        self.ckpt_epochs = {}
+        self.tp_signals = {}
+        self.sync_ckpts = {}
+        for runner_id in range(self.vllm_config.parallel_config.num_runners):
+            if self.tp_size > 1:
+                # preempted_signal, ckpt_epochs
+                self.preempted_signals[runner_id] = mp.Event()
+                self.execution_signals[runner_id] = mp.Event()
+                self.ckpt_epochs[runner_id] = [mp.Value('i', 0) for _ in range(self.tp_size)]
+                self.tp_signals[runner_id] = mp.Event()
+                self.sync_ckpts[runner_id] = mp.Value('i', 0)
+            else:
+                self.preempted_signals[runner_id] = threading.Event()
+                self.execution_signals[runner_id] = threading.Event()
+
+        self.vllm_config.parallel_config.preempted_signals = self.preempted_signals
+        self.vllm_config.parallel_config.execution_signals = self.execution_signals
+        if self.tp_size > 1:
+            self.vllm_config.parallel_config.nccl_lock = mp.Lock()
+            self.vllm_config.parallel_config.ckpt_epochs = self.ckpt_epochs
+            self.vllm_config.parallel_config.sync_ckpts = self.sync_ckpts
+            self.vllm_config.parallel_config.tp_signals = self.tp_signals
+
+    def init_variables(self):
+        self.sch_upd_lock = threading.Lock()
+        self.resource_lock = threading.Lock()
+        self.exe_lock = threading.Lock()
+        self.sort_lock = threading.Lock()
+        self.num_runners = self.vllm_config.parallel_config.num_runners
+        assert self.num_runners is not None
+        self.virtual_runners = deque([i for i in range(self.num_runners)])
+        self.execution_pool = ThreadPoolExecutor(max_workers=self.num_runners)
+        self.async_exe_queue = queue.Queue()
+
+        self.executing_req = None
+        self.waiting: list[Request] = []
+        self.running: list[Request] = []
+        self.event_queue = queue.Queue()
+        self.token_bound = 1024 * 2
+
+        self.is_logger = True
+
+    def set_step_fn(self):
+        self.async_running_queue = queue.Queue()
+        if self.vllm_config.model_config.is_flowprefill:
+            self.init_variables()
+            self.model_executor.collective_rpc(
+                "init_runner_groups", 
+                args=(self.num_runners,)
+                )
+            self.step_fn = self.step_event_driven
+            logger.info("Using step_event_driven step_fn")
+        # elif self.batch_queue is None:
+        #     self.step_fn = self.step
+        #     logger.info("Using original step_fn")
+        # else:
+        #     self.step_fn = self.step_with_batch_queue
+        else:
+            self.step_fn = self.step
+            logger.info("Using original step_fn")
 
     def _initialize_kv_caches(
         self, vllm_config: VllmConfig
@@ -324,6 +411,242 @@ class EngineCore:
 
         return callback
 
+    # One prefill chunk execution
+    def _chunk_step(
+        self,
+        slo_batch: list[Request], 
+        runner_id: int,
+        ):
+        with self.sch_upd_lock:
+            scheduler_output = self.scheduler.prefill_only_schedule(p_requests=slo_batch)
+        
+        model_output = self.model_executor.execute_model(
+            scheduler_output,
+            virtual_runner=runner_id,
+        )
+        with self.sch_upd_lock:
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output)  # add finished_req_ids in scheduler
+        return engine_core_outputs, scheduler_output
+    
+    # A complete prefill execution
+    def prefill_step(
+        self,
+        H_priority_req: Request,
+        slo_batch: list[Request],
+        ):
+        assert H_priority_req.max_tokens == 1
+
+        runner_id = H_priority_req.runner_id
+        engine_core_outputs, scheduler_output = \
+            self._chunk_step(slo_batch, runner_id)
+        with self.sort_lock:
+            H_priority_req.update_execution_time(is_chunk=True)
+            
+        # Execute remain chunk prefill
+        while H_priority_req in self.scheduler.running:
+            assert len(slo_batch) == 1
+            engine_core_outputs, scheduler_output = \
+                  self._chunk_step(slo_batch, runner_id)
+            with self.sort_lock: # for multi-thread safety
+                H_priority_req.update_execution_time(is_chunk=True)
+
+        # Actively mark the final execution completion
+        self.execution_signals[runner_id].set()
+        if self.tp_size > 1:
+            self.tp_signals[runner_id].set()
+
+        with self.exe_lock:
+            self.running.remove(H_priority_req)
+            if self.executing_req.request_id == H_priority_req.request_id:
+                self.executing_req = None
+            self.event_queue.put_nowait("Completion")
+
+        with self.sch_upd_lock:
+            empty_schoutput = SchedulerOutput.make_empty()
+            # clean the request data in the runner
+            empty_schoutput.finished_req_ids = self.scheduler.finished_req_ids
+            self.scheduler.finished_req_ids = set()
+
+        # execute empty
+        _ = self.model_executor.execute_model(
+            empty_schoutput,
+            virtual_runner=runner_id
+            )
+
+        with self.resource_lock:
+            # recycle the runner
+            self.virtual_runners.appendleft(runner_id)
+
+        result_payload = (
+            engine_core_outputs, 
+            scheduler_output.total_num_scheduled_tokens > 0)
+        self.async_exe_queue.put_nowait(result_payload)
+
+    def slo_aware_batching(self, sorted_reqs: list[Request], timestamp: float):
+        Q_one = sorted_reqs[0]
+        slo_batch = [Q_one]
+        # batching short reqs
+        if Q_one.num_tokens_stats > self.token_bound or \
+            (t_remain := Q_one.deadline - timestamp) < (alpha_slack := Q_one.ttft_slo * 0.1): # extremely urgent slack
+            return slo_batch
+        
+        cumul_num_tokens = Q_one.remain_tokens
+        for req in sorted_reqs[1:]:
+            if req.is_running:
+                continue
+            if req.remain_tokens > self.token_bound or \
+                (tmp_num_tokens := cumul_num_tokens + req.remain_tokens) > self.token_bound:
+                continue
+                
+            needed_blocks = math.ceil(tmp_num_tokens / self.scheduler.block_size)
+            if needed_blocks > self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks():
+                continue
+
+            pred_ttft = predict_ttft(tmp_num_tokens)
+            if t_remain - pred_ttft < alpha_slack:
+                break
+            slo_batch.append(req)
+            Q_one.num_tokens_stats = tmp_num_tokens
+            cumul_num_tokens = tmp_num_tokens
+
+        return slo_batch
+
+    # Block until all requests in _reqs_to_process are fully sent
+    def wait_all_reqs_sent(self, timeout: float = 480):
+        start = time.perf_counter()
+        while True:
+            # Free nixl kv blocks status
+            self.free_kv_xfer_blocks()
+            if all(self.collective_rpc("if_reqs_to_process")):
+                return
+            if time.perf_counter() - start > timeout:
+                raise TimeoutError(
+                    f"Timeout waiting for _reqs_to_process"
+                )
+            # Avoid busy spin
+            time.sleep(0.001)
+
+    def free_kv_xfer_blocks(self):
+        kv_outputs = self.collective_rpc("get_finished")
+        kv_output_aggregator = self.model_executor.kv_output_aggregator
+        if self.tp_size > 1:
+            kv_output = kv_output_aggregator.aggregate_kv_outputs(kv_outputs)
+        else:
+            kv_output = kv_outputs[0]
+        if kv_output:
+            self.scheduler._update_from_kv_xfer_finished(kv_output)
+
+    # Event-Driven Scheduling
+    def step_event_driven(self) -> tuple[dict, bool]:
+        with self.exe_lock: # for multi-thread safety
+            self.free_kv_xfer_blocks()
+            reqs = self.running + self.waiting
+            if not reqs:
+                return
+            timestamp = time.perf_counter() # unified timestamp
+            with self.sort_lock:
+                for r in reqs:
+                    r.update_priority(timestamp)
+            sorted_reqs = sorted(reqs, key=lambda r: r.priority, reverse=True)
+
+            H_priority_req = sorted_reqs[0]
+            self.H_priority_req = H_priority_req # record for debug
+            # When the KV cache is insufficient, reqs in the running queue are processed first
+            needed_blocks = math.ceil(H_priority_req.remain_tokens / self.scheduler.block_size)
+            num_free = self.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+            waiting_set = set(self.waiting)
+            if H_priority_req in waiting_set and needed_blocks > num_free: # cannot process new req
+                sorted_reqs = [r for r in sorted_reqs if r not in waiting_set]
+                if not sorted_reqs:
+                    # Executing req has finished, but it has filled the KV pool.
+                    # We need to wait for its KV transfer to complete.
+                    if self.executing_req == None:
+                        self.wait_all_reqs_sent()
+                        self.event_queue.put_nowait("Completion")
+                    return
+                H_priority_req = sorted_reqs[0]
+                self.H_priority_req = H_priority_req
+            H_stats = H_priority_req in waiting_set
+            slo_batch = [H_priority_req]
+            # SLO-aware Batching
+            if H_stats and len(sorted_reqs) > 1:
+                running_set = set(self.running)
+                sorted_reqs_wo_running = [r for r in sorted_reqs if r not in running_set]
+                slo_batch = self.slo_aware_batching( # update batch
+                    sorted_reqs_wo_running, timestamp)
+
+            if H_priority_req != self.executing_req:
+                # Preempt the current executing request
+                if self.executing_req is not None:
+                    if self.is_logger:
+                        s_pree = time.perf_counter()
+                    runner_id = self.executing_req.runner_id
+                    self.preempted_signals[runner_id].clear()
+                    self.execution_signals[runner_id].wait() # wait for ACK
+                    # Update execution time, for priority sorting
+                    with self.sort_lock:
+                        self.executing_req.update_execution_time()
+                    if self.is_logger:
+                        logger.info(f"req {self.executing_req.request_id} have been preempted by "
+                        f"req {H_priority_req.request_id}, cost {time.perf_counter()-s_pree:.4f}s")
+                
+                if H_stats: # if slo_batch:
+                    with self.resource_lock:
+                        new_runner_id = self.virtual_runners.pop()
+                    # Initialize signals
+                    self.preempted_signals[new_runner_id].set() # not preempted
+                    self.execution_signals[new_runner_id].clear() # start execution
+                    if self.tp_size > 1: # update TP signal
+                        for ckpt_epoch in self.ckpt_epochs[new_runner_id]:
+                            ckpt_epoch.value = 0
+                        self.sync_ckpts[new_runner_id].value = 0
+                        self.tp_signals[new_runner_id].set() # for tp preemption
+
+                    H_priority_req.runner_id = new_runner_id
+                    self.execution_pool.submit(
+                        self.prefill_step, H_priority_req, slo_batch)
+                    for req in slo_batch:
+                        self.waiting.remove(req)
+                    self.running.append(H_priority_req)
+                    H_priority_req.is_running = True
+                    # Record execution start timestamp
+                    H_priority_req.start_timestamp = time.perf_counter()
+                else: # elif H_priority_req in self.running:
+                    self.preempted_signals[H_priority_req.runner_id].set()
+                    self.execution_signals[H_priority_req.runner_id].clear()
+                    if self.tp_size > 1:
+                        self.tp_signals[H_priority_req.runner_id].set()
+                    # Reset start timestamp, last execution time span has been recorded
+                    H_priority_req.start_timestamp = time.perf_counter()
+
+                self.executing_req = H_priority_req
+                if self.is_logger:
+                    if (num_batch:=len(slo_batch)) > 1:
+                        logger.info(f"batching {num_batch} reqs, reqs: {[r.request_id for r in slo_batch]}, cost {time.perf_counter()-timestamp:.4f}s")
+
+    # For testing
+    def exec_code(self, code_str: str):
+        import sys
+        from io import StringIO
+        """Execute a string of Python code in the context of self."""
+        try:
+            string_io = StringIO()
+            old_stdout = sys.stdout
+            sys.stdout = string_io
+        
+            local_vars = {'self': self}
+            exec(code_str, {}, local_vars)
+            
+            sys.stdout = old_stdout
+            output = string_io.getvalue()
+            string_io.close()
+            
+            return output.strip()
+
+        except Exception as e:
+            print(f"Error executing code: {e}")
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -335,13 +658,12 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+
         scheduler_output = self.scheduler.schedule()
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        with self.log_error_detail(scheduler_output):
-            model_output = future.result()
-            if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
+            
+        model_output = self.model_executor.execute_model(
+            scheduler_output,
+        )
 
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
@@ -358,7 +680,7 @@ class EngineCore:
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
-
+    
     def step_with_batch_queue(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
@@ -390,7 +712,7 @@ class EngineCore:
             exec_future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
             )
-            if not self.ec_producer:
+            if not self.is_ec_producer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
             if self.is_pooling_model or not model_executed:
@@ -644,9 +966,6 @@ class EngineCoreProc(EngineCore):
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
 
-        # If enable, attach GC debugger after static variable freeze.
-        maybe_attach_gc_debug_callback()
-
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
@@ -853,13 +1172,37 @@ class EngineCoreProc(EngineCore):
 
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
-
+        # Launch a specific output queue thread.
+        if self.vllm_config.model_config.is_flowprefill:
+            threading.Thread(target=self._thread_input_queue, daemon=True).start()
+            threading.Thread(target=self._thread_output_queue, daemon=True).start()
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
-            # 1) Poll the input queue until there is work to do.
-            self._process_input_queue()
-            # 2) Step the engine core and return the outputs.
-            self._process_engine_step()
+            if self.vllm_config.model_config.is_flowprefill:
+                event = self.event_queue.get() # Event Monitor, event-driven consumer
+                self.step_fn()
+            else:
+                # 1) Poll the input queue until there is work to do.
+                self._process_input_queue()
+                self._process_engine_step() # original step
+
+    def _thread_input_queue(self):
+        while True:
+            req = self.input_queue.get()
+            self._handle_client_request(*req)
+
+    def _thread_output_queue(self):
+        while True:
+            outputs, model_executed = self.async_exe_queue.get()
+            for _ in outputs[0].outputs:
+                self.async_running_queue.get()
+
+            # Put EngineCoreOutputs into the output queue.
+            for output in outputs.items() if outputs else ():
+                self.output_queue.put_nowait(output)
+            # Post-step hook.
+            self.post_step(model_executed)
+
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
@@ -869,6 +1212,7 @@ class EngineCoreProc(EngineCore):
             not self.engines_running
             and not self.scheduler.has_requests()
             and not self.batch_queue
+            and self.async_running_queue.empty()
         ):
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
                 logger.debug("EngineCore waiting for work.")
@@ -904,7 +1248,12 @@ class EngineCoreProc(EngineCore):
 
         if request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
-            self.add_request(req, request_wave)
+            if self.vllm_config.model_config.is_flowprefill: # pd-disaggregation & prefill-only
+                self.async_running_queue.put_nowait(req)
+                self.waiting.append(req)
+                self.event_queue.put_nowait("Arrival")
+            else: # original
+                self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:

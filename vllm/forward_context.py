@@ -5,19 +5,18 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 
 import vllm.envs as envs
+from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ubatch_utils import UBatchSlices
-
-if TYPE_CHECKING:
-    from vllm.attention.backends.abstract import AttentionMetadata
-
+import threading
+import multiprocessing as mp
 logger = init_logger(__name__)
 
 track_batchsize: bool = envs.VLLM_LOG_BATCHSIZE_INTERVAL >= 0
@@ -35,23 +34,27 @@ class BatchDescriptor(NamedTuple):
     """
 
     num_tokens: int
-    uniform_decode: bool = False
+    num_reqs: int | None = None
     """
-    False can also be used for an uniform decode batch to dispatch to the 
-    cudagraph supporting non-uniform batches.
+    Number of requests in the batch. Can be None for PIECEWISE cudagraphs where
+    the cudagraphs can handle any number of requests.
+    """
+    uniform: bool = False
+    """
+    True if all the requests in the batch have the same number of tokens.
     """
     has_lora: bool = False
     """
     Whether this batch has active LoRA adapters.
     """
 
-    @property
-    def non_uniform(self) -> "BatchDescriptor":
+    def relax_for_mixed_batch_cudagraphs(self) -> "BatchDescriptor":
         """
-        Return a non-uniform version of current batch descriptor.
+        Return a relaxed version of current batch descriptor that is still compatible
+        with PIECEWISE cudagraphs (or mixed prefill-decode FA cudagraphs).
         """
         return BatchDescriptor(
-            self.num_tokens, uniform_decode=False, has_lora=self.has_lora
+            self.num_tokens, num_reqs=None, uniform=False, has_lora=self.has_lora
         )
 
 
@@ -153,7 +156,7 @@ class DPMetadata:
     @contextmanager
     def sp_local_sizes(self, sequence_parallel_size: int):
         """
-        Context mamager for setting self.local_sizes. Same as self.chunked_sizes
+        Context manager for setting self.local_sizes. Same as self.chunked_sizes
         but without any chunking.
         """
         self.local_sizes = _compute_sp_num_tokens(
@@ -191,7 +194,7 @@ class ForwardContext:
     for each microbatch.
     Set dynamically for each forward pass
     """
-    attn_metadata: dict[str, "AttentionMetadata"] | list[dict[str, "AttentionMetadata"]]
+    attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]]
     # TODO: remove after making all virtual_engines share the same kv cache
     virtual_engine: int  # set dynamically for each forward pass
     # set dynamically for each forward pass
@@ -202,27 +205,42 @@ class ForwardContext:
     batch_descriptor: BatchDescriptor | None = None
 
     ubatch_slices: UBatchSlices | None = None
-
+    
+    virtual_runner: int | None = None # multi-runner for different execution task
+    preempted_signal: threading.Event | None = None # preemption signal
+    execution_signal: threading.Event | None = None # execution signal
+    ckpt_epochs: list[Any] | None = None # tp iteration counter
+    compute_stream: torch.cuda.Stream | None = None # specific CUDA stream
+    nccl_lock: Any | None = None # tp processes lock
+    sync_ckpt: Any | None = None # sync counter
+    tp_signal: Any | None = None # tp signal
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.valid_runtime_modes(), (
             f"Invalid cudagraph runtime mode: {self.cudagraph_runtime_mode}"
         )
 
-
-_forward_context: ForwardContext | None = None
-
-
+# Specific forward context for different threads
+import contextvars
+_forward_context_var: contextvars.ContextVar[ForwardContext] = contextvars.ContextVar(
+    "_forward_context_var", default=None)
 def get_forward_context() -> ForwardContext:
-    """Get the current forward context."""
-    assert _forward_context is not None, (
-        "Forward context is not set. "
-        "Please use `set_forward_context` to set the forward context."
-    )
-    return _forward_context
+    ctx = _forward_context_var.get()
+    # assert ctx is not None, (
+    #     "Forward context is not set. "
+    #     "Please use `set_forward_context` to set the forward context.")
+    return ctx
 
+@contextmanager
+def override_forward_context(forward_context: ForwardContext):
+    token = _forward_context_var.set(forward_context)
+    try:
+        yield
+    finally:
+        _forward_context_var.reset(token)
 
 def is_forward_context_available() -> bool:
-    return _forward_context is not None
+    # return _forward_context is not None
+    return _forward_context_var is not None
 
 
 def create_forward_context(
@@ -233,6 +251,14 @@ def create_forward_context(
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
+    virtual_runner: int | None = None,
+    preempted_signal: threading.Event | None = None,
+    execution_signal: threading.Event | None = None,
+    ckpt_epochs: list[Any] | None = None,
+    compute_stream: torch.cuda.Stream | None = None,
+    nccl_lock: Any | None = None,
+    sync_ckpt: Any | None = None,
+    tp_signal: Any | None = None,
 ):
     return ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
@@ -242,23 +268,15 @@ def create_forward_context(
         cudagraph_runtime_mode=cudagraph_runtime_mode,
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
+        virtual_runner=virtual_runner,
+        preempted_signal=preempted_signal,
+        execution_signal=execution_signal,
+        ckpt_epochs=ckpt_epochs,
+        compute_stream=compute_stream,
+        nccl_lock=nccl_lock,
+        sync_ckpt=sync_ckpt,
+        tp_signal=tp_signal,
     )
-
-
-@contextmanager
-def override_forward_context(forward_context: ForwardContext | None):
-    """A context manager that overrides the current forward context.
-    This is used to override the forward context for a specific
-    forward pass.
-    """
-    global _forward_context
-    prev_context = _forward_context
-    _forward_context = forward_context
-    try:
-        yield
-    finally:
-        _forward_context = prev_context
-
 
 @contextmanager
 def set_forward_context(
@@ -270,6 +288,14 @@ def set_forward_context(
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
+    virtual_runner: int | None = None,
+    preempted_signal: threading.Event | None = None,
+    execution_signal: threading.Event | None = None,
+    ckpt_epochs: list[Any] | None = None,
+    compute_stream: torch.cuda.Stream | None = None,
+    nccl_lock: Any | None = None,
+    sync_ckpt: Any | None = None,
+    tp_signal: Any | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -315,6 +341,14 @@ def set_forward_context(
         cudagraph_runtime_mode,
         batch_descriptor,
         ubatch_slices,
+        virtual_runner,
+        preempted_signal,
+        execution_signal,
+        ckpt_epochs,
+        compute_stream,
+        nccl_lock,
+        sync_ckpt,
+        tp_signal,
     )
 
     try:

@@ -31,7 +31,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from vllm.attention import Attention
+from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -74,7 +74,10 @@ from .utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    execution_record,
+    preemption_check,
 )
+from vllm.forward_context import get_forward_context
 
 logger = init_logger(__name__)
 
@@ -112,9 +115,18 @@ class Qwen3MoeMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        # ctx = get_forward_context()
+
+        # gate_up_proj
+        # execution_record(ctx)
         gate_up, _ = self.gate_up_proj(x)
+        # preemption_check(ctx)
+
+        # down_proj
+        # execution_record(ctx)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
+        # preemption_check(ctx)
         return x
 
 
@@ -187,6 +199,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         assert hidden_states.dim() <= 2, (
             "Qwen3MoeSparseMoeBlock only supports 1D or 2D inputs"
         )
+        # ctx = get_forward_context()
+
+        # gate
+        # execution_record(ctx)
         is_input_1d = hidden_states.dim() == 1
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -196,9 +212,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        # preemption_check(ctx)
+
+        # experts
+        # execution_record(ctx)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
+        # preemption_check(ctx)
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -216,8 +237,7 @@ class Qwen3MoeAttention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        rope_theta: float = 10000,
-        rope_scaling: dict[str, Any] | None = None,
+        rope_parameters: dict[str, Any],
         max_position_embeddings: int = 8192,
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-06,
@@ -247,7 +267,6 @@ class Qwen3MoeAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.dual_chunk_attention_config = dual_chunk_attention_config
 
@@ -273,8 +292,7 @@ class Qwen3MoeAttention(nn.Module):
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
+            rope_parameters=rope_parameters,
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
         self.attn = Attention(
@@ -301,6 +319,10 @@ class Qwen3MoeAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # ctx = get_forward_context()
+
+        # qkv proj
+        # execution_record(ctx)
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # Add qk-norm
@@ -312,22 +334,29 @@ class Qwen3MoeAttention(nn.Module):
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
         q, k = self.rotary_emb(positions, q, k)
+        # preemption_check(ctx)
+
+        # attn
+        # execution_record(ctx)
         attn_output = self.attn(q, k, v)
+        # preemption_check(ctx)
+
+        # o proj
+        # execution_record(ctx)
         output, _ = self.o_proj(attn_output)
+        # preemption_check(ctx)
         return output
 
 
 class Qwen3MoeDecoderLayer(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-
+        
         config = vllm_config.model_config.hf_text_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
 
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
@@ -336,8 +365,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
+            rope_parameters=config.rope_parameters,
             max_position_embeddings=max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, "attention_bias", False),
@@ -378,7 +406,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        ctx = get_forward_context()
         # Self Attention
+        execution_record(ctx)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -388,10 +418,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
+        preemption_check(ctx)
 
         # Fully Connected
+        execution_record(ctx)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        preemption_check(ctx)
+
         return hidden_states, residual
 
 

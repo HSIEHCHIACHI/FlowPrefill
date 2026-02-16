@@ -21,6 +21,7 @@ from vllm.v1.engine import (
 )
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
+from vllm.v1.engine.utils import predict_ttft
 
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
@@ -56,7 +57,8 @@ class Request:
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(
             sampling_params
         )
-        self.arrival_time = arrival_time if arrival_time is not None else time.time()
+        self.arrival_time = arrival_time if arrival_time is not None else time.perf_counter()
+        self.is_running = False
 
         self.status = RequestStatus.WAITING
         self.events: list[EngineCoreEvent] = []
@@ -64,6 +66,7 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+        self.runner_id: int | None = None
 
         if pooling_params is not None:
             # Pooling models.
@@ -79,6 +82,18 @@ class Request:
                 self.kv_transfer_params = sampling_params.extra_args.get(
                     "kv_transfer_params"
                 )
+                # Serving metrics
+                ttft_slo = sampling_params.extra_args.get("ttft_slo")
+                if ttft_slo is not None:
+                    self.ttft_slo = ttft_slo
+                tbt_slo = sampling_params.extra_args.get("tbt_slo")
+                if tbt_slo is not None:
+                    self.tbt_slo = tbt_slo
+                arrival = sampling_params.extra_args.get("arrival")
+                if arrival is not None:
+                    self.arrival = arrival
+                    self.deadline = arrival + ttft_slo
+                    self.edf_deadline = self.deadline
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
@@ -87,6 +102,8 @@ class Request:
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
         )
+        # self.pred_ttft = predict_ttft(self.num_prompt_tokens)
+        self.num_tokens_stats = self.num_prompt_tokens
         self._output_token_ids: list[int] = []
         self._all_token_ids: list[int] = (
             self.prompt_token_ids.copy()
@@ -96,6 +113,7 @@ class Request:
         self.num_output_placeholders = 0  # Used in async scheduling.
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        self.actual_num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related
@@ -121,6 +139,9 @@ class Request:
         # The number of requests being preempted by the scheduler
         self.num_preemptions = 0
 
+        # The number of tokens that have been computed remotely.
+        self.num_external_computed_tokens = 0
+
         self.block_hashes: list[BlockHash] = []
         self.get_hash_new_full_blocks: Callable[[], list[BlockHash]] | None = None
         if block_hasher is not None:
@@ -128,6 +149,40 @@ class Request:
             self.block_hashes = self.get_hash_new_full_blocks()
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
+
+        self.execution_time = 0 # The executed time
+        self.start_timestamp = None
+
+    @property
+    def remain_tokens(self):
+        return self.num_tokens_stats - self.actual_num_computed_tokens
+    
+    @property
+    def pred_ttft(self):
+        return predict_ttft(self.remain_tokens)
+
+    # Update the execution time and stop the execution time record
+    def update_execution_time(self, is_chunk = False):
+        if is_chunk: # Each chunk records its execution time separately
+            if self.start_timestamp is not None:
+                self.start_timestamp = time.perf_counter()
+            self.execution_time = 0
+        else: # preempted
+            self.execution_time += (time.perf_counter() - self.start_timestamp)
+            self.start_timestamp = None
+
+    def update_priority(self, timestamp):
+        deadline_remain = self.deadline - timestamp
+        # Update timestamp info
+        if self.start_timestamp is not None:
+            e_span = timestamp - self.start_timestamp
+            pred_remain = self.pred_ttft - e_span - self.execution_time
+        else:
+            pred_remain = self.pred_ttft - self.execution_time
+
+        slack = deadline_remain - max(pred_remain, 0)
+        sgn_slack = 1 if slack > 0 else -1
+        self.priority = sgn_slack / self.edf_deadline
 
     @classmethod
     def from_engine_core_request(

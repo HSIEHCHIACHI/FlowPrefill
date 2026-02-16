@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import hashlib
 import os
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -30,6 +29,7 @@ else:
     RuntimeEnv = Any
     PlacementGroup = Any
     Executor = Any
+import threading
 
 logger = init_logger(__name__)
 
@@ -61,10 +61,15 @@ class EPLBConfig:
     Log the balancedness each step of expert parallelism.
     This is turned off by default since it will cause communication overhead.
     """
+    use_async: bool = False
+    """
+    Whether to use non-blocking EPLB.
+    """
 
 
 @config
-@dataclass
+# @dataclass
+@dataclass(config={"arbitrary_types_allowed": True})
 class ParallelConfig:
     """Configuration for the distributed execution."""
 
@@ -72,6 +77,8 @@ class ParallelConfig:
     """Number of pipeline parallel groups."""
     tensor_parallel_size: int = 1
     """Number of tensor parallel groups."""
+    prefill_context_parallel_size: int = 1
+    """Number of prefill context parallel groups."""
     data_parallel_size: int = 1
     """Number of data parallel groups. MoE layers will be sharded according to
     the product of the tensor parallel size and data parallel size."""
@@ -136,22 +143,6 @@ class ParallelConfig:
     - "deepep_high_throughput": Use deepep high-throughput kernels
     - "deepep_low_latency": Use deepep low-latency kernels
     - "flashinfer_all2allv": Use flashinfer alltoallv kernels for mnnvl"""
-    num_redundant_experts: int | None = None
-    """`num_redundant_experts` is deprecated and has been replaced with
-    `eplb_config.num_redundant_experts`. This will be removed in v0.12.0.
-    Please use `eplb_config.num_redundant_experts` instead."""
-    eplb_window_size: int | None = None
-    """`eplb_window_size` is deprecated and has been replaced with
-    `eplb_config.window_size`. This will be removed in v0.12.0.
-    Please use `eplb_config.window_size` instead."""
-    eplb_step_interval: int | None = None
-    """`eplb_step_interval` is deprecated and has been replaced with
-    `eplb_config.step_interval`. This will be removed in v0.12.0.
-    Please use `eplb_config.step_interval` instead."""
-    eplb_log_balancedness: bool | None = None
-    """`eplb_log_balancedness` is deprecated and has been replaced with
-    `eplb_config.log_balancedness`. This will be removed in v0.12.0.
-    Please use `eplb_config.log_balancedness` instead."""
 
     max_parallel_loading_workers: int | None = None
     """Maximum number of parallel loading workers when loading model
@@ -240,14 +231,25 @@ class ParallelConfig:
     needs to be divisible by dcp_size."""
 
     dcp_kv_cache_interleave_size: int = 1
-    """Interleave size of kv_cache storage while using dcp or cp > 1,
-    store interleave_size tokens on (d)cp i,
-    then store next interleave_size tokens on (d)cp i+1.
-    Interleave_size=1: token-level align, token i is stored on rank i % (d)cp_size.
-    Interleave_size=block_size: block-level align, first fill the block on first rank,
-    token is stored on rank i+1 block j after rank i block j is full.
-    Block_size should be greater than or equal to dcp_kv_cache_interleave_size.
-    Block_size should be divisible by dcp_kv_cache_interleave_size.
+    """
+    Interleave size of kv_cache storage while using DCP.
+    dcp_kv_cache_interleave_size has been replaced by cp_kv_cache_interleave_size,
+    and will be deprecated when PCP is fully supported.
+
+    """
+    cp_kv_cache_interleave_size: int = 1
+    """Interleave size of kv_cache storage while using DCP or PCP.
+    For `total_cp_rank = pcp_rank * dcp_world_size + dcp_rank`,
+        and `total_cp_world_size = pcp_world_size * dcp_world_size`.
+    store interleave_size tokens on total_cp_rank i,
+    then store next interleave_size tokens on total_cp_rank i+1.
+    Interleave_size=1: token-level alignment, where token `i` is stored on
+        total_cp_rank `i % total_cp_world_size`.
+    Interleave_size=block_size: block-level alignment, where tokens are
+        first populated to the preceding ranks. Tokens are then stored
+        in (rank i+1, block j) only after (rank i, block j) is fully occupied.
+    Block_size should be greater than or equal to cp_kv_cache_interleave_size.
+    Block_size should be divisible by cp_kv_cache_interleave_size.
     """
 
     _api_process_count: int = Field(default=1, gt=0)
@@ -268,6 +270,14 @@ class ParallelConfig:
         This is an internal config that is only valid for and
         should only be set by API server scale-out.
     """
+    dev_ranks: list[int] | None = None # device rank
+    preempted_signals: dict[int, threading.Event, threading.Event] | None = None # preemption signals
+    execution_signals: dict[int, threading.Event, threading.Event] | None = None # execution signals
+    num_runners: int | None = None # number of runners
+    ckpt_epochs: dict[int, list[Any]] | None = None # tp iteration counter
+    nccl_lock: Any | None = None # tp processes lock
+    sync_ckpts: dict[int, Any] | None = None # sync counter
+    tp_signals: dict[int, Any] | None = None # tp signals
 
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
@@ -312,6 +322,11 @@ class ParallelConfig:
                     "num_redundant_experts."
                 )
 
+        if self.prefill_context_parallel_size > 1:
+            raise ValueError(
+                "Prefill context parallelism is not fully supported. "
+                "Please set prefill_context_parallel_size to 1."
+            )
         return self
 
     @property
@@ -448,19 +463,41 @@ class ParallelConfig:
         This hash is also used for DP worker configuration validation
         to prevent hangs from mismatched collective communication patterns.
         """
-        factors: list[Any] = []
-        factors.append(self.pipeline_parallel_size)
-        factors.append(self.tensor_parallel_size)
-        factors.append(self.enable_expert_parallel)
-        factors.append(self.data_parallel_size)
-        factors.append(self.all2all_backend)
-        factors.append(self.enable_eplb)
-        if self.enable_eplb:
-            factors.append(self.eplb_config.log_balancedness)
-            factors.append(self.eplb_config.window_size)
-            factors.append(self.eplb_config.step_interval)
-            factors.append(self.eplb_config.num_redundant_experts)
-        return hashlib.sha256(str(factors).encode()).hexdigest()
+        ignored_factors = {
+            # Derived/runtime topology, networking, or launch details
+            "data_parallel_rank",
+            "data_parallel_rank_local",
+            "data_parallel_backend",
+            "data_parallel_external_lb",
+            "data_parallel_hybrid_lb",
+            "data_parallel_master_ip",
+            "data_parallel_master_port",
+            "_data_parallel_master_port_list",
+            "data_parallel_rpc_port",
+            "rank",
+            "master_addr",
+            "master_port",
+            "node_rank",
+            "nnodes",
+            "max_parallel_loading_workers",
+            "disable_custom_all_reduce",
+            "ray_workers_use_nsight",
+            "ray_runtime_env",
+            "placement_group",
+            "distributed_executor_backend",
+            "worker_cls",
+            "sd_worker_cls",
+            "worker_extension_cls",
+            "_api_process_count",
+            "_api_process_rank",
+        }
+
+        from vllm.config.utils import get_hash_factors, hash_factors
+
+        factors = get_hash_factors(self, ignored_factors)
+        # Explicitly include backend affecting env factor as before
+        factors["VLLM_ALL2ALL_BACKEND"] = str(envs.VLLM_ALL2ALL_BACKEND)
+        return hash_factors(factors)
 
     def __post_init__(self) -> None:
         # Set all2all_backend from env var if not specified, with deprecation warning
@@ -473,42 +510,12 @@ class ParallelConfig:
                     "--all2all-backend command-line argument instead."
                 )
 
-        # Forward deprecated fields to their new location
-        if self.num_redundant_experts is not None:
-            self.eplb_config.num_redundant_experts = self.num_redundant_experts
-            logger.warning_once(
-                "num_redundant_experts is deprecated and has been replaced "
-                "with eplb_config.num_redundant_experts. This will be removed "
-                "in v0.12.0. Changing this field after initialization will "
-                "have no effect."
-            )
-        if self.eplb_window_size is not None:
-            self.eplb_config.window_size = self.eplb_window_size
-            logger.warning_once(
-                "eplb_window_size is deprecated and has been replaced "
-                "with eplb_config.window_size. This will be removed "
-                "in v0.12.0. Changing this field after initialization will "
-                "have no effect."
-            )
-        if self.eplb_step_interval is not None:
-            self.eplb_config.step_interval = self.eplb_step_interval
-            logger.warning_once(
-                "eplb_step_interval is deprecated and has been replaced "
-                "with eplb_config.step_interval. This will be removed "
-                "in v0.12.0. Changing this field after initialization will "
-                "have no effect."
-            )
-        if self.eplb_log_balancedness is not None:
-            self.eplb_config.log_balancedness = self.eplb_log_balancedness
-            logger.warning_once(
-                "eplb_log_balancedness is deprecated and has been replaced "
-                "with eplb_config.log_balancedness. This will be removed "
-                "in v0.12.0. Changing this field after initialization will "
-                "have no effect."
-            )
-
         # Continue with the rest of the initialization
-        self.world_size = self.pipeline_parallel_size * self.tensor_parallel_size
+        self.world_size = (
+            self.pipeline_parallel_size
+            * self.tensor_parallel_size
+            * self.prefill_context_parallel_size
+        )
 
         if self.distributed_executor_backend == "external_launcher":
             logger.info("Using external launcher for distributed inference.")
@@ -596,9 +603,10 @@ class ParallelConfig:
                 "max_parallel_loading_workers is currently "
                 "not supported and will be ignored."
             )
-        if self.distributed_executor_backend != "mp" and self.nnodes > 1:
+        if self.distributed_executor_backend not in ("mp", "uni") and self.nnodes > 1:
             raise ValueError(
-                "nnodes > 1 can only be set when distributed exectuor backend is mp."
+                "nnodes > 1 can only be set when distributed executor "
+                "backend is mp or uni."
             )
 
     @property

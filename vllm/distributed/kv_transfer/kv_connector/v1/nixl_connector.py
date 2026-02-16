@@ -4,7 +4,6 @@ import contextlib
 import copy
 import logging
 import math
-import os
 import queue
 import threading
 import time
@@ -21,7 +20,7 @@ import torch
 import zmq
 
 from vllm import envs
-from vllm.attention import AttentionBackend
+from vllm.attention.backends.abstract import AttentionBackend, AttentionMetadata
 from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.attention.selector import get_attn_backend
 from vllm.config import VllmConfig
@@ -52,7 +51,6 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.block_table import BlockTable
 
 if TYPE_CHECKING:
-    from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -309,7 +307,7 @@ class NixlConnector(KVConnectorBase_V1):
         self,
         layer_name: str,
         kv_layer: torch.Tensor,
-        attn_metadata: "AttentionMetadata",
+        attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> None:
         """NixlConnector does not save explicitly."""
@@ -317,7 +315,8 @@ class NixlConnector(KVConnectorBase_V1):
 
     def wait_for_save(self):
         assert self.connector_worker is not None
-        assert isinstance(self._connector_metadata, NixlConnectorMetadata)
+        # no need assert when using async prefill and use_host_buffer is False
+        # assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         if self.connector_worker.use_host_buffer and self.connector_worker.copy_blocks:
             self.connector_worker.save_kv_to_host(self._connector_metadata)
 
@@ -350,7 +349,8 @@ class NixlConnectorScheduler:
         self.engine_id: EngineId = engine_id
         self.side_channel_host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST
         self.side_channel_port = (
-            envs.VLLM_NIXL_SIDE_CHANNEL_PORT
+            # envs.VLLM_NIXL_SIDE_CHANNEL_PORT
+            vllm_config.kv_transfer_config.kv_port
             + vllm_config.parallel_config.data_parallel_rank
         )
         assert vllm_config.kv_transfer_config is not None
@@ -677,12 +677,13 @@ class NixlConnectorWorker:
         mapping between local and remote TP workers.
         """
 
-        tp_size: int
         tp_rank: int
         remote_tp_size: dict[EngineId, int]
         is_mla: bool
         total_num_kv_heads: int
         attn_backend: type[AttentionBackend]
+        engine_id: EngineId
+        remote_block_size: dict[EngineId, int]
 
         def __post_init__(self):
             # Figure out whether the first dimension of the cache is K/V
@@ -710,8 +711,13 @@ class NixlConnectorWorker:
                 self.is_mla or self._use_pallas or self.is_kv_layout_blocks_first
             )
 
-        block_size: int
-        remote_block_size: dict[EngineId, int]
+        @property
+        def tp_size(self) -> int:
+            return self.remote_tp_size[self.engine_id]
+
+        @property
+        def block_size(self) -> int:
+            return self.remote_block_size[self.engine_id]
 
         def tp_ratio(
             self,
@@ -804,9 +810,6 @@ class NixlConnectorWorker:
         self.nixl_backends = vllm_config.kv_transfer_config.get_from_extra_config(
             "backends", ["UCX"]
         )
-        # TODO temporary, once nixl allows for telemetry flag in config
-        # (next release), we can remove this env var.
-        os.environ["NIXL_TELEMETRY_ENABLE"] = "1"
 
         # Agent.
         non_ucx_backends = [b for b in self.nixl_backends if b != "UCX"]
@@ -822,10 +825,11 @@ class NixlConnectorWorker:
         if nixl_agent_config is None:
             config = None
         else:
+            # Enable telemetry by default for NIXL 0.7.1 and above.
             config = (
-                nixl_agent_config(backends=self.nixl_backends)
+                nixl_agent_config(backends=self.nixl_backends, capture_telemetry=True)
                 if len(non_ucx_backends) > 0
-                else nixl_agent_config(num_threads=num_threads)
+                else nixl_agent_config(num_threads=num_threads, capture_telemetry=True)
             )
 
         self.nixl_wrapper = NixlWrapper(str(uuid.uuid4()), config)
@@ -957,13 +961,12 @@ class NixlConnectorWorker:
         self.xfer_stats = NixlKVConnectorStats()
 
         self.kv_topo = self.TpKVTopology(
-            tp_size=self.world_size,
             tp_rank=self.tp_rank,
+            engine_id=self.engine_id,
             remote_tp_size=self._tp_size,  # shared state
+            remote_block_size=self._block_size,  # shared state
             is_mla=self.use_mla,
             total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
-            block_size=self.block_size,
-            remote_block_size=self._block_size,
             attn_backend=backend,
         )
         self._use_pallas = self.kv_topo._use_pallas
@@ -1037,10 +1040,12 @@ class NixlConnectorWorker:
         NOT directly supported by NIXL (e.g., tpu)
         """
         xfer_buffers: dict[str, torch.Tensor] = {}
+        inv_order = [0, 1, 3, 2, 4]
         try:
             for layer_name, kv_cache in kv_caches.items():
                 kv_shape = kv_cache.shape
                 kv_dtype = kv_cache.dtype
+                permute_shape = False
                 if (
                     self.kv_cache_layout == "NHD"
                     and self.vllm_config.kv_transfer_config is not None
@@ -1054,10 +1059,20 @@ class NixlConnectorWorker:
                     # Since NHD will not support Decode/Prefill TP_ratio > 1,
                     # we can leverage host_buffer for permute
                     self.host_buffer_kv_cache_layout = "HND"
-                    kv_shape = tuple(kv_shape[i] for i in [0, 1, 3, 2, 4])
+                    kv_shape = (
+                        tuple(kv_shape[i] for i in inv_order)
+                        if not self.use_mla
+                        else kv_shape
+                    )
+                    permute_shape = not self.use_mla
+
                 xfer_buffers[layer_name] = torch.empty(
                     kv_shape, dtype=kv_dtype, device="cpu"
                 )
+                if permute_shape:
+                    xfer_buffers[layer_name] = xfer_buffers[layer_name].permute(
+                        inv_order
+                    )
         except MemoryError as e:
             logger.error("NIXLConnectorWorker gets %s.", e)
             raise
@@ -1156,6 +1171,14 @@ class NixlConnectorWorker:
         # to better exploit the memory layout (ie num_blocks is the first dim).
         split_k_and_v = self.kv_topo.split_k_and_v
         tensor_size_bytes = None
+
+        # TODO (NickLucche): Get kernel_block_size in a cleaner way
+        # NHD default "view" for non-MLA cache
+        if self.device_type == "cpu":
+            block_size_position = -2
+        else:
+            block_size_position = -2 if self.use_mla else -3
+
         # Enable different block lengths for different layers when MLA is used.
         self.block_len_per_layer = list[int]()
         self.slot_size_per_layer = list[int]()  # HD bytes in kv terms
@@ -1170,9 +1193,7 @@ class NixlConnectorWorker:
                 if base_addr in seen_base_addresses:
                     continue
 
-                # TODO (NickLucche): Get kernel_block_size in a cleaner way
-                # NHD default "view" for non-MLA cache
-                kernel_block_size = cache.shape[-2] if self.use_mla else cache.shape[-3]
+                kernel_block_size = cache.shape[block_size_position]
 
                 if self.block_size != kernel_block_size:
                     logger.info_once(
@@ -1185,6 +1206,7 @@ class NixlConnectorWorker:
                         self.block_size // kernel_block_size
                     )
                     self.block_size = kernel_block_size
+                    self._block_size[self.engine_id] = kernel_block_size
 
                 seen_base_addresses.append(base_addr)
                 curr_tensor_size_bytes = cache.numel() * cache.element_size()
@@ -1718,33 +1740,33 @@ class NixlConnectorWorker:
                 len(done_sending),
                 len(done_recving),
             )
+        if self.use_host_buffer:
+            block_ids_to_permute = []
+            block_ids_for_blocksize_post_process = defaultdict(list)
+            for req_id in done_recving:
+                # clean up metadata for completed requests
+                meta = self._recving_metadata.pop(req_id, None)
+                assert meta is not None, f"{req_id} not found in recving_metadata list"
+                if self.use_host_buffer:
+                    self.sync_recved_kv_to_device(req_id, meta)
+                if self.enable_permute_local_kv:
+                    block_ids_to_permute += meta.local_physical_block_ids
 
-        block_ids_to_permute = []
-        block_ids_for_blocksize_post_process = defaultdict(list)
-        for req_id in done_recving:
-            # clean up metadata for completed requests
-            meta = self._recving_metadata.pop(req_id, None)
-            assert meta is not None, f"{req_id} not found in recving_metadata list"
-            if self.use_host_buffer:
-                self.sync_recved_kv_to_device(req_id, meta)
-            if self.enable_permute_local_kv:
-                block_ids_to_permute += meta.local_physical_block_ids
-
-            # post processing for heteroblocksize
-            block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(
-                meta.remote_engine_id
-            )
-            if (
-                not self.use_mla
-                and block_size_ratio > 1
-                and self.kv_cache_layout == "HND"
-            ):
-                block_ids_for_blocksize_post_process[block_size_ratio].append(
-                    meta.local_block_ids
+                # post processing for heteroblocksize
+                block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(
+                    meta.remote_engine_id
                 )
-        self.blocksize_post_process(block_ids_for_blocksize_post_process)
-        if len(block_ids_to_permute) > 0:
-            self.permute_device_kv(block_ids_to_permute)
+                if (
+                    not self.use_mla
+                    and block_size_ratio > 1
+                    and self.kv_cache_layout == "HND"
+                ):
+                    block_ids_for_blocksize_post_process[block_size_ratio].append(
+                        meta.local_block_ids
+                    )
+            self.blocksize_post_process(block_ids_for_blocksize_post_process)
+            if len(block_ids_to_permute) > 0:
+                self.permute_device_kv(block_ids_to_permute)
 
         # Handle timeout to avoid stranding blocks on remote.
         now = time.perf_counter()
@@ -1761,7 +1783,9 @@ class NixlConnectorWorker:
                 count,
                 envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT,
             )
-            self._reqs_to_process.remove(req_id)
+            if req_id in self._reqs_to_process:
+                self._reqs_to_process.remove(req_id)
+            # self._reqs_to_process.remove(req_id)
             del self._reqs_to_send[req_id]
             done_sending.add(req_id)
 
@@ -1811,34 +1835,54 @@ class NixlConnectorWorker:
         done_req_ids: set[str] = set()
         for req_id, handles in list(transfers.items()):
             in_progress = False
-            for handle, _xfer_stime in handles:
-                xfer_state = self.nixl_wrapper.check_xfer_state(handle)
-                if xfer_state == "DONE":
-                    # Get telemetry from NIXL
-                    res = self.nixl_wrapper.get_xfer_telemetry(handle)
-                    self.xfer_stats.record_transfer(res)
-                    self.nixl_wrapper.release_xfer_handle(handle)
-                elif xfer_state == "PROC":
-                    in_progress = True
-                    continue
-                else:
-                    # transfer failed - mark blocks as invalid
-                    logger.error(
-                        "NIXL transfer failed for request %s with state %s. "
+            for handle, xfer_start_time in handles:
+                try:
+                    xfer_state = self.nixl_wrapper.check_xfer_state(handle)
+                    if xfer_state == "DONE":
+                        # Get telemetry from NIXL
+                        res = self.nixl_wrapper.get_xfer_telemetry(handle)
+                        self.xfer_stats.record_transfer(res)
+                        self.nixl_wrapper.release_xfer_handle(handle)
+                    elif xfer_state == "PROC":
+                        in_progress = True
+                        continue
+                    else:
+                        logger.error(
+                            "NIXL transfer failed for request %s with state "
+                            "%s. Marking blocks as invalid.",
+                            req_id,
+                            xfer_state,
+                        )
+                        self._handle_failed_transfer(req_id, handle)
+                        in_progress = False
+                except Exception:
+                    logger.exception(
+                        "NIXL transfer exception for request %s. "
                         "Marking blocks as invalid.",
                         req_id,
-                        xfer_state,
                     )
-                    # mark all (logical)blocks for this request as invalid
-                    if meta := self._recving_metadata.pop(req_id, None):
-                        self._invalid_block_ids.update(meta.local_block_ids)
-                    self._recving_metadata.pop(req_id, None)
-                    self.nixl_wrapper.release_xfer_handle(handle)
-                    self.xfer_stats.record_failed_transfer()
+                    self._handle_failed_transfer(req_id, handle)
+                    in_progress = False
+
             if not in_progress:
                 done_req_ids.add(req_id)
                 del transfers[req_id]
         return done_req_ids
+
+    def _handle_failed_transfer(self, req_id: str, handle: int):
+        """
+        Handle a failed transfer by marking all (logical) blocks as invalid and
+        recording the failure.
+
+        Args:
+            req_id: The request ID.
+            handle: The transfer handle.
+        """
+        if meta := self._recving_metadata.pop(req_id, None):
+            self._invalid_block_ids.update(meta.local_block_ids)
+        self._recving_metadata.pop(req_id, None)
+        self.nixl_wrapper.release_xfer_handle(handle)
+        self.xfer_stats.record_failed_transfer()
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
         """

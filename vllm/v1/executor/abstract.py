@@ -198,11 +198,16 @@ class Executor(ABC):
         pass
 
     def execute_model(
-        self, scheduler_output: SchedulerOutput, non_block: bool = False
-    ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
-        output = self.collective_rpc(  # type: ignore[call-overload]
-            "execute_model", args=(scheduler_output,), non_block=non_block
-        )
+        self,
+        scheduler_output: SchedulerOutput,
+        non_block: bool = False,
+        virtual_runner: int = None,
+    ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:
+        output = self.collective_rpc("execute_model",
+                                     args=(scheduler_output, 
+                                           virtual_runner,
+                                           ),
+                                     non_block=non_block)
         return output[0]
 
     @overload

@@ -217,6 +217,81 @@ class KVOutputAggregator:
 
         return output
 
+    def aggregate_kv_outputs(
+        self,
+        kv_outputs: list[KVConnectorOutput | None],
+    ) -> KVConnectorOutput | None:
+        if not kv_outputs or all(kv is None for kv in kv_outputs):
+            return None
+
+        def update_finished_set(
+            req_ids: set[str] | None,
+            remaining_count_dict: dict[str, int],
+            finished_set: set[str],
+        ) -> None:
+            for req_id in req_ids or ():
+                remaining_count = remaining_count_dict.get(
+                    req_id, self._expected_finished_count
+                )
+                remaining_count -= 1
+                if remaining_count == 0:
+                    finished_set.add(req_id)
+                    remaining_count_dict.pop(req_id, None)
+                else:
+                    remaining_count_dict[req_id] = remaining_count
+
+        finished_sending: set[str] = set()
+        finished_recving: set[str] = set()
+        aggregated_kv_connector_stats = None
+        invalid_block_ids: set[int] = set()
+
+        for kv_output in kv_outputs:
+            if kv_output is None:
+                continue
+
+            # dynamic expected_finished_count update
+            if (
+                kv_output.expected_finished_count > 0
+                and kv_output.expected_finished_count != self._expected_finished_count
+            ):
+                logger.debug(
+                    "Expected finished requests updated from %d to %d",
+                    self._expected_finished_count,
+                    kv_output.expected_finished_count,
+                )
+                self._expected_finished_count = kv_output.expected_finished_count
+
+            update_finished_set(
+                kv_output.finished_sending, self._send_remaining_count, finished_sending
+            )
+            update_finished_set(
+                kv_output.finished_recving, self._recv_remaining_count, finished_recving
+            )
+
+            # aggregate kv_connector_stats
+            if kv_output.kv_connector_stats:
+                if aggregated_kv_connector_stats is None:
+                    aggregated_kv_connector_stats = kv_output.kv_connector_stats
+                else:
+                    assert isinstance(
+                        aggregated_kv_connector_stats,
+                        type(kv_output.kv_connector_stats),
+                    )
+                    aggregated_kv_connector_stats = (
+                        aggregated_kv_connector_stats.aggregate(
+                            kv_output.kv_connector_stats
+                        )
+                    )
+
+            invalid_block_ids |= kv_output.invalid_block_ids
+
+        return KVConnectorOutput(
+            finished_sending=finished_sending or None,
+            finished_recving=finished_recving or None,
+            kv_connector_stats=aggregated_kv_connector_stats or None,
+            invalid_block_ids=invalid_block_ids,
+            expected_finished_count=self._expected_finished_count,
+        )
 
 def _make_src_and_dst_indices(
     src_block_ids: list[int],

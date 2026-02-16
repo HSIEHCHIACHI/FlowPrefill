@@ -10,16 +10,19 @@ import torch
 import torch.nn as nn
 from torch.func import functional_call
 from transformers import PretrainedConfig
-from typing_extensions import deprecated
 
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
+)
+from vllm.model_executor.model_loader.online_quantization import (
+    support_quantized_model_reload_from_hp_weights,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import supports_any_eagle
@@ -34,7 +37,6 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
     get_cuda_view_from_cpu_tensor,
 )
-
 logger = init_logger(__name__)
 
 WeightsMapping = Mapping[str, str | None]
@@ -316,6 +318,7 @@ class AutoWeightsLoader:
                 )
                 raise ValueError(msg)
 
+    @support_quantized_model_reload_from_hp_weights
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -477,54 +480,6 @@ def _merge_multimodal_embeddings(
     return inputs_embeds
 
 
-@deprecated(
-    "`merge_multimodal_embeddings` has been replaced with "
-    "`SupportsMultiModal.embed_input_ids` and will be "
-    "removed in v0.12."
-)
-def merge_multimodal_embeddings(
-    input_ids: torch.Tensor,
-    inputs_embeds: torch.Tensor,
-    multimodal_embeddings: NestedTensors,
-    placeholder_token_id: int | list[int],
-) -> torch.Tensor:
-    """
-    Merge `multimodal_embeddings` into `inputs_embeds` by overwriting the
-    positions in `inputs_embeds` corresponding to placeholder tokens in
-    `input_ids`.
-
-    `placeholder_token_id` can be a list of token ids (e.g, token ids
-    of img_start, img_break, and img_end tokens) when needed: This means
-    the order of these tokens in the `input_ids` MUST MATCH the order of
-    their embeddings in `multimodal_embeddings` since we need to
-    slice-merge instead of individually scattering.
-
-    For example, if input_ids is "TTTTTSIIIBIIIBIIIETTT", where
-    - T is text token
-    - S is image start token
-    - I is image embedding token
-    - B is image break token
-    - E is image end token.
-
-    Then the image embeddings (that correspond to I's) from vision encoder
-    must be padded with embeddings of S, B, and E in the same order of
-    input_ids for a correct embedding merge.
-
-    Note:
-        This updates `inputs_embeds` in place.
-    """
-    if isinstance(placeholder_token_id, list):
-        is_multimodal = isin_list(input_ids, placeholder_token_id)
-    else:
-        is_multimodal = input_ids == placeholder_token_id
-
-    return _merge_multimodal_embeddings(
-        inputs_embeds,
-        multimodal_embeddings=multimodal_embeddings,
-        is_multimodal=is_multimodal,
-    )
-
-
 def isin_list(
     elements: torch.Tensor,
     test_elements_list: list[int],
@@ -630,6 +585,32 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
 
     return module
 
+def execution_record(ctx):
+    if ctx and ctx.preempted_signal is not None:
+        ctx.execution_signal.clear()
+
+def preemption_check(ctx):
+    if ctx is not None:
+        ctx.compute_stream.synchronize()
+
+    if ctx is not None and ctx.preempted_signal is not None:
+        # ctx.compute_stream.synchronize()
+        tp_group = get_tp_group()
+        if tp_group.world_size > 1:
+            rank = tp_group.rank
+            ctx.ckpt_epochs[rank].value+=1
+            with ctx.nccl_lock:
+                if not ctx.preempted_signal.is_set():
+                    ctx.sync_ckpt.value = ctx.ckpt_epochs[rank].value+1 # tp_checkpoint
+                    ctx.preempted_signal.set() # notifying just one of the ranks will suffice
+                    ctx.tp_signal.clear() # tp_signal
+            if ctx.ckpt_epochs[rank].value == ctx.sync_ckpt.value:
+                tp_group.barrier()
+                ctx.execution_signal.set() # operator completion, send ACK
+                ctx.tp_signal.wait()
+        else:
+            ctx.execution_signal.set() # operator completion, send ACK
+            ctx.preempted_signal.wait()
 
 def make_layers(
     num_hidden_layers: int,

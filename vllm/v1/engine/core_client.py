@@ -880,6 +880,7 @@ class AsyncMPClient(MPClient):
         assert self.outputs_queue is not None
         outputs = await self.outputs_queue.get()
         if isinstance(outputs, Exception):
+            logger.info(f"An error occurred: {outputs}")  # 打印异常信息
             raise self._format_exception(outputs) from None
         return outputs
 

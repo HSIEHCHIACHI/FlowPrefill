@@ -92,17 +92,22 @@ class UniProcExecutor(Executor):
         return future
 
     def execute_model(  # type: ignore[override]
-        self, scheduler_output: SchedulerOutput, non_block: bool = False
+        self, 
+        scheduler_output: SchedulerOutput, 
+        non_block: bool = False,
+        virtual_runner: int = None,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
         return self.collective_rpc(
             "execute_model",
-            args=(scheduler_output,),
+            args=(scheduler_output, virtual_runner),
             non_block=non_block,
             single_value=True,
         )
 
     def sample_tokens(  # type: ignore[override]
-        self, grammar_output: GrammarOutput | None, non_block: bool = False
+        self, 
+        grammar_output: GrammarOutput | None, 
+        non_block: bool = False,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
         return self.collective_rpc(
             "sample_tokens",
