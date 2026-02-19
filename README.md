@@ -1,4 +1,4 @@
-# FlowPrefill: Decoupling Preemption from Prefill Scheduling Granularity to Mitigate Head-of-Line Blocking in LLM Serving [[paper]()]
+# FlowPrefill: Decoupling Preemption from Prefill Scheduling Granularity to Mitigate Head-of-Line Blocking in LLM Serving [[paper](https://arxiv.org/abs/2602.16603)]
 
 ## Abstract
 The growing demand for large language models (LLMs) requires serving systems to handle many concurrent requests with diverse service level objectives (SLOs). This exacerbates head-of-line (HoL) blocking during the compute-intensive prefill phase, where long-running requests monopolize resources and delay higher-priority ones, leading to widespread time-to-first-token (TTFT) SLO violations. While chunked prefill enables interruptibility, it introduces an inherent trade-off between responsiveness and throughput: reducing chunk size improves response latency but degrades computational efficiency, whereas increasing chunk size maximizes throughput but exacerbates blocking. This necessitates an adaptive preemption mechanism. However, dynamically balancing execution granularity against scheduling overheads remains a key challenge.
@@ -62,4 +62,13 @@ python benchmarks/benchmark_online.py --model <MODEL_PATH> --rate-scale 1.0 --tr
 
 ## Citation
 ```
+@misc{hsieh2026flowprefilldecouplingpreemptionprefill,
+      title={FlowPrefill: Decoupling Preemption from Prefill Scheduling Granularity to Mitigate Head-of-Line Blocking in LLM Serving}, 
+      author={Chia-chi Hsieh and Zan Zong and Xinyang Chen and Jianjiang Li and Jidong Zhai and Lijie Wen},
+      year={2026},
+      eprint={2602.16603},
+      archivePrefix={arXiv},
+      primaryClass={cs.DC},
+      url={https://arxiv.org/abs/2602.16603}, 
+}
 ```
