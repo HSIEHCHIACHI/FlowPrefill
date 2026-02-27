@@ -64,7 +64,7 @@ from .utils import (
 )
 
 
-# @torch.compile(backend=current_platform.simple_compile_backend)
+@torch.compile(backend=current_platform.simple_compile_backend)
 def layer_norm_func(hidden_states, weight, variance_epsilon):
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.to(torch.float32)

@@ -1153,11 +1153,11 @@ def fused_topk_bias(
 
 
 # This is used by the Deepseek-V2 and Deepseek-V3 model
-# @torch.compile(
-#     dynamic=True,
-#     backend=current_platform.simple_compile_backend,
-#     options=maybe_disable_graph_partition(current_platform.simple_compile_backend),
-# )
+@torch.compile(
+    dynamic=True,
+    backend=current_platform.simple_compile_backend,
+    options=maybe_disable_graph_partition(current_platform.simple_compile_backend),
+)
 def grouped_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1241,7 +1241,7 @@ def grouped_topk(
         topk_weights = topk_weights * routed_scaling_factor
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
-# @torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
+@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
 def eplb_map_to_physical_and_record(
     topk_ids: torch.Tensor,
     expert_load_view: torch.Tensor,

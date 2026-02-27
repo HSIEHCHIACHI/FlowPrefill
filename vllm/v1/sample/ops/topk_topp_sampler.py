@@ -218,7 +218,7 @@ class TopKTopPSampler(nn.Module):
 
 # Note: this is a workaround for
 # https://github.com/pytorch/pytorch/pull/151218
-# @torch.compile(dynamic=True)
+@torch.compile(dynamic=True)
 def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
     probs = logits.softmax(dim=-1, dtype=torch.float32)
     q = torch.empty_like(probs)

@@ -40,12 +40,10 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
-# create_block_mask_compiled = torch.compile(
-#     create_block_mask, fullgraph=True, mode="reduce-overhead"
-# )
-# flex_attention_compiled = torch.compile(flex_attention, fullgraph=True)
-create_block_mask_compiled = create_block_mask
-flex_attention_compiled = flex_attention
+create_block_mask_compiled = torch.compile(
+    create_block_mask, fullgraph=True, mode="reduce-overhead"
+)
+flex_attention_compiled = torch.compile(flex_attention, fullgraph=True)
 
 def _offsets_to_doc_ids_tensor(offsets: torch.Tensor) -> torch.Tensor:
     device = offsets.device
