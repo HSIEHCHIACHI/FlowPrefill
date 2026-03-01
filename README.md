@@ -62,13 +62,10 @@ python benchmarks/benchmark_online.py --model <MODEL_PATH> --rate-scale 1.0 --tr
 
 ## Citation
 ```
-@misc{hsieh2026flowprefilldecouplingpreemptionprefill,
-      title={FlowPrefill: Decoupling Preemption from Prefill Scheduling Granularity to Mitigate Head-of-Line Blocking in LLM Serving}, 
-      author={Chia-chi Hsieh and Zan Zong and Xinyang Chen and Jianjiang Li and Jidong Zhai and Lijie Wen},
-      year={2026},
-      eprint={2602.16603},
-      archivePrefix={arXiv},
-      primaryClass={cs.DC},
-      url={https://arxiv.org/abs/2602.16603}, 
+@article{hsieh2026flowprefill,
+  title={FlowPrefill: Decoupling Preemption from Prefill Scheduling Granularity to Mitigate Head-of-Line Blocking in LLM Serving},
+  author={Hsieh, Chia-chi and Zong, Zan and Chen, Xinyang and Li, Jianjiang and Zhai, Jidong and Wen, Lijie},
+  journal={arXiv preprint arXiv:2602.16603},
+  year={2026}
 }
 ```
