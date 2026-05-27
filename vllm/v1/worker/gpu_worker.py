@@ -125,6 +125,10 @@ class Worker(WorkerBase):
             self.runner_list[runner_id].tp_signal = \
                 self.vllm_config.parallel_config.tp_signals[runner_id]
             self.runner_list[runner_id].tp_signal.set()
+            self.runner_list[runner_id].ack_signals = \
+                self.vllm_config.parallel_config.tp_signals
+        else:
+            self.runner_list[runner_id].ack_signals = preempted_signals
 
     def init_runner_groups(self, num_runners) -> list[GPUModelRunner]:
         from vllm.config import set_current_vllm_config
@@ -625,6 +629,7 @@ class Worker(WorkerBase):
         self, 
         scheduler_output: "SchedulerOutput",
         virtual_runner: int = None,
+        ack_runner_id: int = None,
     ) -> ModelRunnerOutput | None:
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
@@ -674,7 +679,7 @@ class Worker(WorkerBase):
         with self.annotate_profile(scheduler_output):
             if virtual_runner is not None:
                 output = self.runner_list[virtual_runner].execute_model(
-                    scheduler_output, intermediate_tensors)
+                    scheduler_output, intermediate_tensors, ack_runner_id)
             else:
                 output = self.model_runner.execute_model(
                     scheduler_output, intermediate_tensors)

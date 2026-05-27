@@ -102,8 +102,7 @@ class Request:
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
         )
-        # self.pred_ttft = predict_ttft(self.num_prompt_tokens)
-        self.num_tokens_stats = self.num_prompt_tokens
+        self.num_tokens_stats = self.num_prompt_tokens # for batching snapshot
         self._output_token_ids: list[int] = []
         self._all_token_ids: list[int] = (
             self.prompt_token_ids.copy()
@@ -152,14 +151,30 @@ class Request:
 
         self.execution_time = 0 # The executed time
         self.start_timestamp = None
+        self.slack = 0
 
     @property
     def remain_tokens(self):
         return self.num_tokens_stats - self.actual_num_computed_tokens
-    
+
     @property
     def pred_ttft(self):
         return predict_ttft(self.remain_tokens)
+
+    def pred_remain(self, timestamp):
+        # Update timestamp info
+        if self.start_timestamp is not None:
+            e_span = timestamp - self.start_timestamp
+            pred_remain = self.pred_ttft - e_span - self.execution_time
+        else:
+            pred_remain = self.pred_ttft - self.execution_time
+        return pred_remain
+
+    def update_slack(self, timestamp):
+        deadline_remain = self.deadline - timestamp
+        pred_remain = self.pred_remain(timestamp)
+        self.slack = deadline_remain - max(pred_remain, 0)
+        return pred_remain
 
     # Update the execution time and stop the execution time record
     def update_execution_time(self, is_chunk = False):
@@ -173,16 +188,12 @@ class Request:
 
     def update_priority(self, timestamp):
         deadline_remain = self.deadline - timestamp
-        # Update timestamp info
-        if self.start_timestamp is not None:
-            e_span = timestamp - self.start_timestamp
-            pred_remain = self.pred_ttft - e_span - self.execution_time
-        else:
-            pred_remain = self.pred_ttft - self.execution_time
+        pred_remain = self.pred_remain(timestamp)
 
-        slack = deadline_remain - max(pred_remain, 0)
-        sgn_slack = 1 if slack > 0 else -1
+        self.slack = deadline_remain - max(pred_remain, 0)
+        sgn_slack = 1 if self.slack > 0 else -1
         self.priority = sgn_slack / self.edf_deadline
+        return pred_remain
 
     @classmethod
     def from_engine_core_request(

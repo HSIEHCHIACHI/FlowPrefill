@@ -320,14 +320,15 @@ class MultiprocExecutor(Executor):
         self,
         scheduler_output: SchedulerOutput,
         non_block: bool = False,
-        virtual_runner: int = None, 
+        virtual_runner: int = None,
+        ack_runner_id: int = None,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
 
         if not self.has_connector:
             # Get output from output_rank only
             futures_or_results = self.collective_rpc(
                 "execute_model",
-                args=(scheduler_output, virtual_runner), 
+                args=(scheduler_output, virtual_runner, ack_runner_id), 
                 unique_reply_rank=self.output_rank,
                 non_block=non_block,
                 timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS)
@@ -338,7 +339,7 @@ class MultiprocExecutor(Executor):
         # Get output from all workers (TP/PP aggregation case)
         outputs = self.collective_rpc(
             "execute_model",
-            args=(scheduler_output, virtual_runner), 
+            args=(scheduler_output, virtual_runner, ack_runner_id),
             non_block=non_block,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS)
 

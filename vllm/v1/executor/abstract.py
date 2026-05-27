@@ -202,10 +202,12 @@ class Executor(ABC):
         scheduler_output: SchedulerOutput,
         non_block: bool = False,
         virtual_runner: int = None,
+        ack_runner_id: int = None,
     ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:
         output = self.collective_rpc("execute_model",
                                      args=(scheduler_output, 
                                            virtual_runner,
+                                           ack_runner_id,
                                            ),
                                      non_block=non_block)
         return output[0]

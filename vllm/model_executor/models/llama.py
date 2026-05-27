@@ -67,7 +67,6 @@ from .utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
-    execution_record,
     preemption_check,
 )
 from vllm.forward_context import get_forward_context, ForwardContext
@@ -114,12 +113,10 @@ class LlamaMLP(nn.Module):
         # ctx = get_forward_context()
 
         # gateup_proj
-        # execution_record(ctx)
         x, _ = self.gate_up_proj(x)
         # preemption_check(ctx)
 
         # down_proj
-        # execution_record(ctx)
         x = self.act_fn(x)
         x, _ = self.down_proj(x)
         # preemption_check(ctx)
@@ -256,12 +253,10 @@ class LlamaAttention(nn.Module):
         # ctx = get_forward_context()
 
         # qkv_proj
-        # execution_record(ctx)
         qkv, _ = self.qkv_proj(hidden_states)
         # preemption_check(ctx)
 
         # attn
-        # execution_record(ctx)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         if self.do_llama_4_scaling:
@@ -271,7 +266,6 @@ class LlamaAttention(nn.Module):
         # preemption_check(ctx)
 
         # o_proj
-        # execution_record(ctx)
         output, _ = self.o_proj(attn_output)
         # preemption_check(ctx)
 
@@ -368,7 +362,6 @@ class LlamaDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # ctx = get_forward_context()
         # Self Attention
-        execution_record(ctx)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -378,7 +371,6 @@ class LlamaDecoderLayer(nn.Module):
         preemption_check(ctx)
 
         # Fully Connected
-        execution_record(ctx)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         preemption_check(ctx)
@@ -457,7 +449,6 @@ class LlamaModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         ctx = get_forward_context()
-        # execution_record(ctx) # chunk check
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -472,14 +463,13 @@ class LlamaModel(nn.Module):
         aux_hidden_states = []
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
-        ):   
-            # execution_record(ctx) # layer check
+        ):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
             hidden_states, residual = layer(
                 positions, hidden_states, residual, ctx)
             # preemption_check(ctx) # layer check
-            
+
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}

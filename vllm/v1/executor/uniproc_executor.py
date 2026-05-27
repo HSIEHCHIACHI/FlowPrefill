@@ -96,10 +96,11 @@ class UniProcExecutor(Executor):
         scheduler_output: SchedulerOutput, 
         non_block: bool = False,
         virtual_runner: int = None,
+        ack_runner_id: int = None,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
         return self.collective_rpc(
             "execute_model",
-            args=(scheduler_output, virtual_runner),
+            args=(scheduler_output, virtual_runner, ack_runner_id),
             non_block=non_block,
             single_value=True,
         )

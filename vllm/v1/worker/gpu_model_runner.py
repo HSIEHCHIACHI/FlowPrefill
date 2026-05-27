@@ -271,6 +271,7 @@ class GPUModelRunner(
         self.runner_id = None
         self.preempted_signal: threading.Event | None = None
         self.execution_signal: threading.Event | None = None
+        self.ack_signals: list[Any] | None = None
         self.ckpt_epochs: list[Any] | None = None
         self.nccl_lock: Any | None = None
         self.sync_ckpt: Any | None = None
@@ -2803,16 +2804,18 @@ class GPUModelRunner(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors = None,
+        ack_runner_id: int = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         with torch.cuda.stream(self.compute_stream):
             output = self._execute_model_impl(
-                scheduler_output, intermediate_tensors)
+                scheduler_output, intermediate_tensors, ack_runner_id)
             return output
 
     def _execute_model_impl(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
+        ack_runner_id: int = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         # if self.execute_model_state is not None:
         #     raise RuntimeError(
@@ -2963,6 +2966,9 @@ class GPUModelRunner(
             cudagraph_mode = CUDAGraphMode.NONE
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
+
+        if ack_runner_id is not None: # async schedule
+            self.ack_signals[ack_runner_id].wait() # wait for preemption done
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.

@@ -43,12 +43,12 @@ def init_pred_ttfts():
         not Path(envs.VLLM_PROFILER_PATH).is_file():
         logger.info("---------- VLLM_PROFILER_PATH is None ----------")
         return np.zeros(128*1024, dtype=int)
-    pred_arr = []
-    for i in range(128*1024):
-        pred_arr.append(_predict(i))
-    return pred_arr
-def _predict(num_tokens, chunk=1024*8):
+    pred_M = []
     pred_arr = np.load(envs.VLLM_PROFILER_PATH)
+    for i in range(128*1024):
+        pred_M.append(_predict(pred_arr, i))
+    return np.array(pred_M)
+def _predict(pred_arr, num_tokens, chunk=1024*8):
     if chunk > len(pred_arr):
         chunk = 8192
     if num_tokens == 0:
