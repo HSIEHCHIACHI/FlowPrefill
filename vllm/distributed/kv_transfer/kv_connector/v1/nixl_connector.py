@@ -164,6 +164,9 @@ class NixlConnector(KVConnectorBase_V1):
     ):
         super().__init__(vllm_config, role, kv_cache_config)
 
+        # Per-thread metadata so concurrent FlowPrefill runners don't clobber it.
+        self._tls = threading.local()
+
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
@@ -176,6 +179,20 @@ class NixlConnector(KVConnectorBase_V1):
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
             self.connector_worker = NixlConnectorWorker(vllm_config, self.engine_id)
+
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        self._tls.metadata = connector_metadata
+
+    def clear_connector_metadata(self) -> None:
+        self._tls.metadata = None
+
+    def _get_connector_metadata(self) -> KVConnectorMetadata:
+        metadata = getattr(self._tls, "metadata", None)
+        assert metadata is not None
+        return metadata
+
+    def has_connector_metadata(self) -> bool:
+        return getattr(self._tls, "metadata", None) is not None
 
     ############################################################
     # Class Methods
@@ -296,8 +313,9 @@ class NixlConnector(KVConnectorBase_V1):
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
-        assert isinstance(self._connector_metadata, NixlConnectorMetadata)
-        self.connector_worker.start_load_kv(self._connector_metadata)
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, NixlConnectorMetadata)
+        self.connector_worker.start_load_kv(metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """NixlConnector does not do layerwise saving."""
@@ -318,7 +336,7 @@ class NixlConnector(KVConnectorBase_V1):
         # no need assert when using async prefill and use_host_buffer is False
         # assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         if self.connector_worker.use_host_buffer and self.connector_worker.copy_blocks:
-            self.connector_worker.save_kv_to_host(self._connector_metadata)
+            self.connector_worker.save_kv_to_host(self._get_connector_metadata())
 
     def shutdown(self):
         if self.connector_worker is not None:
@@ -349,8 +367,8 @@ class NixlConnectorScheduler:
         self.engine_id: EngineId = engine_id
         self.side_channel_host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST
         self.side_channel_port = (
-            # envs.VLLM_NIXL_SIDE_CHANNEL_PORT
-            vllm_config.kv_transfer_config.kv_port
+            envs.VLLM_NIXL_SIDE_CHANNEL_PORT
+            # vllm_config.kv_transfer_config.kv_port
             + vllm_config.parallel_config.data_parallel_rank
         )
         assert vllm_config.kv_transfer_config is not None
@@ -930,6 +948,10 @@ class NixlConnectorWorker:
         # Protects _handshake_futures and _remote_agents.
         self._handshake_lock = threading.RLock()
 
+        # Serializes mutations to per-request bookkeeping across runner
+        # threads and the engine main thread.
+        self._state_lock = threading.Lock()
+
         self.block_size = vllm_config.cache_config.block_size
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -1126,9 +1148,10 @@ class NixlConnectorWorker:
                 logger.exception(
                     "Handshake failed for request %s, marking blocks as invalid", req_id
                 )
-                if req_meta := self._recving_metadata.get(req_id):
-                    self._invalid_block_ids.update(req_meta.local_block_ids)
-                self._failed_recv_reqs.add(req_id)
+                with self._state_lock:
+                    if req_meta := self._recving_metadata.get(req_id):
+                        self._invalid_block_ids.update(req_meta.local_block_ids)
+                    self._failed_recv_reqs.add(req_id)
 
         fut.add_done_callback(request_ready)
 
@@ -1725,69 +1748,70 @@ class NixlConnectorWorker:
         The scheduler process (via the MultiprocExecutor) will use this output
         to track which workers are done.
         """
-        done_sending = self._get_new_notifs()
-        done_recving = self._pop_done_transfers(self._recving_transfers)
+        with self._state_lock:
+            done_sending = self._get_new_notifs()
+            done_recving = self._pop_done_transfers(self._recving_transfers)
 
-        # add requests that skipped transfer to done_recving
-        done_recving.update(self._failed_recv_reqs)
-        self._failed_recv_reqs.clear()
+            # add requests that skipped transfer to done_recving
+            done_recving.update(self._failed_recv_reqs)
+            self._failed_recv_reqs.clear()
 
-        if len(done_sending) > 0 or len(done_recving) > 0:
-            logger.debug(
-                "Rank %s, get_finished: %s requests done sending "
-                "and %s requests done recving",
-                self.tp_rank,
-                len(done_sending),
-                len(done_recving),
-            )
-        if self.use_host_buffer:
-            block_ids_to_permute = []
-            block_ids_for_blocksize_post_process = defaultdict(list)
-            for req_id in done_recving:
-                # clean up metadata for completed requests
-                meta = self._recving_metadata.pop(req_id, None)
-                assert meta is not None, f"{req_id} not found in recving_metadata list"
-                if self.use_host_buffer:
-                    self.sync_recved_kv_to_device(req_id, meta)
-                if self.enable_permute_local_kv:
-                    block_ids_to_permute += meta.local_physical_block_ids
-
-                # post processing for heteroblocksize
-                block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(
-                    meta.remote_engine_id
+            if len(done_sending) > 0 or len(done_recving) > 0:
+                logger.debug(
+                    "Rank %s, get_finished: %s requests done sending "
+                    "and %s requests done recving",
+                    self.tp_rank,
+                    len(done_sending),
+                    len(done_recving),
                 )
-                if (
-                    not self.use_mla
-                    and block_size_ratio > 1
-                    and self.kv_cache_layout == "HND"
-                ):
-                    block_ids_for_blocksize_post_process[block_size_ratio].append(
-                        meta.local_block_ids
-                    )
-            self.blocksize_post_process(block_ids_for_blocksize_post_process)
-            if len(block_ids_to_permute) > 0:
-                self.permute_device_kv(block_ids_to_permute)
+            if self.use_host_buffer:
+                block_ids_to_permute = []
+                block_ids_for_blocksize_post_process = defaultdict(list)
+                for req_id in done_recving:
+                    # clean up metadata for completed requests
+                    meta = self._recving_metadata.pop(req_id, None)
+                    assert meta is not None, f"{req_id} not found in recving_metadata list"
+                    if self.use_host_buffer:
+                        self.sync_recved_kv_to_device(req_id, meta)
+                    if self.enable_permute_local_kv:
+                        block_ids_to_permute += meta.local_physical_block_ids
 
-        # Handle timeout to avoid stranding blocks on remote.
-        now = time.perf_counter()
-        while self._reqs_to_send:
-            req_id, expires = next(iter(self._reqs_to_send.items()))
-            # Sorted dict, oldest requests are put first so we can exit early.
-            if now < expires:
-                break
-            count = self.consumer_notification_counts_by_req.pop(req_id, 0)
-            logger.warning(
-                "Releasing expired KV blocks for request %s which were "
-                "retrieved by %d decode worker(s) within %d seconds.",
-                req_id,
-                count,
-                envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT,
-            )
-            if req_id in self._reqs_to_process:
-                self._reqs_to_process.remove(req_id)
-            # self._reqs_to_process.remove(req_id)
-            del self._reqs_to_send[req_id]
-            done_sending.add(req_id)
+                    # post processing for heteroblocksize
+                    block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(
+                        meta.remote_engine_id
+                    )
+                    if (
+                        not self.use_mla
+                        and block_size_ratio > 1
+                        and self.kv_cache_layout == "HND"
+                    ):
+                        block_ids_for_blocksize_post_process[block_size_ratio].append(
+                            meta.local_block_ids
+                        )
+                self.blocksize_post_process(block_ids_for_blocksize_post_process)
+                if len(block_ids_to_permute) > 0:
+                    self.permute_device_kv(block_ids_to_permute)
+
+            # Handle timeout to avoid stranding blocks on remote.
+            now = time.perf_counter()
+            while self._reqs_to_send:
+                req_id, expires = next(iter(self._reqs_to_send.items()))
+                # Sorted dict, oldest requests are put first so we can exit early.
+                if now < expires:
+                    break
+                count = self.consumer_notification_counts_by_req.pop(req_id, 0)
+                logger.warning(
+                    "Releasing expired KV blocks for request %s which were "
+                    "retrieved by %d decode worker(s) within %d seconds.",
+                    req_id,
+                    count,
+                    envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT,
+                )
+                if req_id in self._reqs_to_process:
+                    self._reqs_to_process.remove(req_id)
+                # self._reqs_to_process.remove(req_id)
+                del self._reqs_to_send[req_id]
+                done_sending.add(req_id)
 
         return done_sending, done_recving
 
@@ -1889,57 +1913,58 @@ class NixlConnectorWorker:
         Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
-        for req_id, meta in metadata.reqs_to_recv.items():
-            meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
-                meta.local_block_ids
-            )
-            meta.remote_block_ids = self._logical_to_kernel_block_ids(
-                meta.remote_block_ids
-            )
-            remote_engine_id = meta.remote_engine_id
-            logger.debug(
-                "start_load_kv for request %s from remote engine %s. "
-                "Num local_block_ids: %s. Num remote_block_ids: %s. ",
-                req_id,
-                remote_engine_id,
-                len(meta.local_physical_block_ids),
-                len(meta.remote_block_ids),
-            )
-            # always store metadata for failure recovery
-            self._recving_metadata[req_id] = meta
-            if remote_engine_id not in self._remote_agents:
-                # Initiate handshake with remote engine to exchange metadata.
-                with self._handshake_lock:
-                    if remote_engine_id not in self._remote_agents:
-                        self._background_nixl_handshake(req_id, remote_engine_id, meta)
-                        continue
+        with self._state_lock:
+            for req_id, meta in metadata.reqs_to_recv.items():
+                meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
+                    meta.local_block_ids
+                )
+                meta.remote_block_ids = self._logical_to_kernel_block_ids(
+                    meta.remote_block_ids
+                )
+                remote_engine_id = meta.remote_engine_id
+                logger.debug(
+                    "start_load_kv for request %s from remote engine %s. "
+                    "Num local_block_ids: %s. Num remote_block_ids: %s. ",
+                    req_id,
+                    remote_engine_id,
+                    len(meta.local_physical_block_ids),
+                    len(meta.remote_block_ids),
+                )
+                # always store metadata for failure recovery
+                self._recving_metadata[req_id] = meta
+                if remote_engine_id not in self._remote_agents:
+                    # Initiate handshake with remote engine to exchange metadata.
+                    with self._handshake_lock:
+                        if remote_engine_id not in self._remote_agents:
+                            self._background_nixl_handshake(req_id, remote_engine_id, meta)
+                            continue
 
-            # Handshake already completed, start async read xfer.
-            self._read_blocks_for_req(req_id, meta)
+                # Handshake already completed, start async read xfer.
+                self._read_blocks_for_req(req_id, meta)
 
-        # Start transfers for requests whose handshakes have now finished.
-        while not self._ready_requests.empty():
-            self._read_blocks_for_req(*self._ready_requests.get_nowait())
+            # Start transfers for requests whose handshakes have now finished.
+            while not self._ready_requests.empty():
+                self._read_blocks_for_req(*self._ready_requests.get_nowait())
 
-        # Keep around the requests that have been part of a batch. This is
-        # needed because async scheduling pushes the misalignment between the
-        # moment in which requests expiration is set (P side) and the moment in
-        # which blocks are read from D. As P can now more easily lag behind D
-        # while processing the next batch, we make sure to only set an
-        # expiration for requests that have not been read from D yet.
-        for req_id in metadata.reqs_in_batch:
-            self._reqs_to_process.add(req_id)
+            # Keep around the requests that have been part of a batch. This is
+            # needed because async scheduling pushes the misalignment between the
+            # moment in which requests expiration is set (P side) and the moment in
+            # which blocks are read from D. As P can now more easily lag behind D
+            # while processing the next batch, we make sure to only set an
+            # expiration for requests that have not been read from D yet.
+            for req_id in metadata.reqs_in_batch:
+                self._reqs_to_process.add(req_id)
 
-        # Remove all requests that are not to be processed (eg aborted).
-        for req_id in metadata.reqs_not_processed:
-            self._reqs_to_process.discard(req_id)
-            # We should never get an abort after setting an expiry timer
-            assert req_id not in self._reqs_to_send
+            # Remove all requests that are not to be processed (eg aborted).
+            for req_id in metadata.reqs_not_processed:
+                self._reqs_to_process.discard(req_id)
+                # We should never get an abort after setting an expiry timer
+                assert req_id not in self._reqs_to_send
 
-        # Add to requests that are waiting to be read and track expiration.
-        for req_id, expiration_time in metadata.reqs_to_send.items():
-            if req_id in self._reqs_to_process:
-                self._reqs_to_send[req_id] = expiration_time
+            # Add to requests that are waiting to be read and track expiration.
+            for req_id, expiration_time in metadata.reqs_to_send.items():
+                if req_id in self._reqs_to_process:
+                    self._reqs_to_send[req_id] = expiration_time
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         logger.debug(
@@ -2220,8 +2245,9 @@ class NixlConnectorWorker:
         This is called by the scheduler to identify blocks that need
         to be retried after a NIXL transfer failure.
         """
-        result = self._invalid_block_ids
-        self._invalid_block_ids = set()
+        with self._state_lock:
+            result = self._invalid_block_ids
+            self._invalid_block_ids = set()
         return result
 
     def __del__(self):
