@@ -43,17 +43,22 @@ python trace_build/trace.py --lower 0 --upper 2
 Perform profiling and fit a TTFT prediction model.
 
 ```shell
-DO_PROFILING=1 bash run_serve.sh
+python profiler/profiling.py --model <MODEL_PATH> --tp-size 2
 ```
 
 #### Run server
+For single node
 ```shell
-bash run_serve.sh
+bash run_single_node.sh
+```
+For multiple node
+```shell
+bash run_multi_node.sh
 ```
 
 #### Run benchmark
 ```shell
-python benchmarks/benchmark_online.py --model <MODEL_PATH> --rate-scale 1.0 --trace-path trace_build/qwen_traceA_0.0min_2.0min.jsonl
+python benchmarks/benchmark.py --model <MODEL_PATH> --rate-scale 1.0 --trace-path trace_build/qwen_traceA_0.0min_2.0min.jsonl
 ```
 
 ## Note

@@ -13,10 +13,10 @@ from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput, async_re
 PROXY_PORT = None
 MODEL_PATH = None
 SLO_DICT = {
-    "text": (0.25, 0.1),
-    "image": (0.5, 0.1),
-    "search": (4.0, 0.2),
-    "file": (6.0, 0.2),
+    "text": (0.4, 0.1),
+    "image": (0.8, 0.05),
+    "search": (6.5, 0.2),
+    "file": (9.0, 0.2),
 }
 
 async def launch_req(idx, req_dict, is_print=True):
@@ -80,8 +80,8 @@ def res_print(results, start_time):
 
 async def warm_up():
     req_dict = {
-        "prompt": "where is the capital of France? ", "output_length": 4, 
-        "num_tokens": 7, "ttft_slo": 0.1, "tbt_slo": 0.1, "type": None}
+        "prompt": "the " * 256, "output_length": 8, 
+        "num_tokens": 256, "ttft_slo": 0.1, "tbt_slo": 0.1, "type": None}
     for i in range(32):
         out = await launch_req(i, req_dict, is_print=False)
 
@@ -102,7 +102,6 @@ async def benchmark(rate_scale, trace_path):
     for idx, req_dict in enumerate(sampled_reqs):
         await asyncio.sleep(intervals[idx])
         tasks.append(asyncio.create_task(launch_req(idx, req_dict, is_print=True)))
-        # tasks.append(asyncio.create_task(launch_req(idx, req_dict, is_print=False)))
     span = time.perf_counter()-start_time
     
     results = await asyncio.gather(*tasks)
@@ -113,7 +112,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--rate-scale", type=float, default=1.0)
     parser.add_argument("--port", type=int, default=8192)
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-14B-Instruct")
     parser.add_argument("--trace-path", type=str, default="trace_build/qwen_traceA_0.0min_2.0min.jsonl")
     args = parser.parse_args()
 

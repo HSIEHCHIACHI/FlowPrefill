@@ -1,53 +1,73 @@
 #!/bin/bash
 
 # =============================================================================
-# vLLM Disaggregated Serving Script - P2P NCCL XpYd Architecture
+# vLLM Disaggregated Serving Script - Single-Node P2P NIXL XpYd Architecture
 # =============================================================================
-# This script demonstrates disaggregated prefill and decode serving using
-# P2P NCCL communication. The architecture supports various XpYd configurations:
+# This script launches an XpYd (X prefill + Y decode) disaggregated PD setup
+# on a SINGLE machine, with all servers communicating via NIXL. It supports
+# arbitrary X and Y, for example:
 #
-# - 1P1D: 1 Prefill server + 1 Decode servers (current default)
+# - 1P1D: 1 Prefill server + 1 Decode server
+# - 2P2D: 2 Prefill servers + 2 Decode servers (default below)
 # - 3P1D: 3 Prefill servers + 1 Decode server
 # - etc.
 #
-# Configuration can be customized via environment variables:
-#   MODEL: Model to serve
-#   TP_SIZE: Tensor parallelism size
-#   PROFILER: Profiler file
-#   PREFILL_GPUS: Comma-separated GPU IDs for prefill servers
-#   DECODE_GPUS: Comma-separated GPU IDs for decode servers
-#   PREFILL_PORTS: Comma-separated ports for prefill servers
-#   DECODE_PORTS: Comma-separated ports for decode servers
-#   PROXY_PORT: Proxy server port used to setup XpYd connection.
-#   TIMEOUT_SECONDS: Server startup timeout
+# Each prefill / decode server is one vllm process on this host. GPUs and HTTP
+# ports must be partitioned so servers don't overlap; the script does NOT
+# verify that for you.
+#
+# For multi-host deployments use run_multi_node.sh instead.
+#
+# Environment variables:
+#   MODEL                          Model to serve
+#   TP_SIZE                        TP per server
+#   PROFILER                       Profiler file
+#   PREFILL_GPUS / DECODE_GPUS     Per-server GPU IDs. ';' between servers,
+#                                  ',' between GPUs. E.g. 0,1;2,3
+#   PREFILL_PORTS / DECODE_PORTS   Per-server HTTP ports, ',' separated
+#   PROXY_PORT                     Proxy server port
+#   TIMEOUT_SECONDS                Per-server startup timeout
+#   LOG_ROOT / RUN_ID              Log root and per-run sub-dir
 # =============================================================================
 
 # Configuration - can be overridden via environment variables
-# llama-3.1-8B-Instruct, llama_8b_a800_tp1_prefill
-# Qwen2.5-14B-Instruct, Qwen_14b_a800_tp2_prefill
-MODEL=${MODEL:-/home/fit/zhaijdzz/WORK/models/llama-3.1-8B-Instruct}
-TP_SIZE=${TP_SIZE:-1}
+MODEL=${MODEL:-Qwen/Qwen2.5-14B-Instruct}
+TP_SIZE=${TP_SIZE:-2}
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 MODEL_NAME="$(basename -- "$MODEL")"
-PROFILER=${PROFILER:-"${SCRIPT_DIR}/profiler/profile_${MODEL_NAME}_tp${TP_SIZE}_online.npy"}
+PROFILER=${PROFILER:-"${SCRIPT_DIR}/profiler/profile_${MODEL_NAME}_tp${TP_SIZE}.npy"}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
 PROXY_PORT=${PROXY_PORT:-8192}
-DO_PROFILING=${DO_PROFILING:-0} # 1=profiling, 0=no profiling
 
-# Default 1P1D configuration (1 Prefill + 1 Decode)
-PREFILL_GPUS=${PREFILL_GPUS:-"0"}
-DECODE_GPUS=${DECODE_GPUS:-"1"}
+# Per-run log directory: log/<timestamp>_run_single_node/
+LOG_ROOT=${LOG_ROOT:-"${SCRIPT_DIR}/log"}
+RUN_ID=${RUN_ID:-"$(date +%Y%m%d_%H%M%S)_run_single_node"}
+RUN_LOG_DIR="${LOG_ROOT}/${RUN_ID}"
+
+# Default 1P1D configuration (1 prefill server + 1 decode server)
+PREFILL_GPUS=${PREFILL_GPUS:-0,1}
+DECODE_GPUS=${DECODE_GPUS:-2,3}
 PREFILL_PORTS=${PREFILL_PORTS:-20000}
-DECODE_PORTS=${DECODE_PORTS:-21001}
+DECODE_PORTS=${DECODE_PORTS:-21000}
+
+# 2P2D configuration (2 prefill + 2 decode, each server uses 2 GPUs)
+# ';' separates servers; ',' separates GPUs within a server.
+# PREFILL_GPUS=${PREFILL_GPUS:-0,1;2,3} # 2P
+# PREFILL_PORTS=${PREFILL_PORTS:-20000,20001}
+# DECODE_GPUS=${DECODE_GPUS:-4,5;6,7} # 2D
+# DECODE_PORTS=${DECODE_PORTS:-21000,21001}
+
+PREFILL_NIXL_PORT=5500
+DECODE_NIXL_PORT=7500
+PREFILL_MEM_FRACTION_STATIC=0.8
+DECODE_MEM_FRACTION_STATIC=0.85
 
 # Check if the profiler file exists.
 if [[ ! -f "$PROFILER" ]]; then
-  if [[ "$DO_PROFILING" != "1" ]]; then
-    echo "ERROR: profiler file not found: $PROFILER" >&2
-    echo "       Set DO_PROFILING=1 to generate it, or set PROFILER to an existing file." >&2
-    exit 1
-  fi
+  echo "ERROR: profiler file not found: $PROFILER" >&2
+  echo "       Set PROFILER to an existing file." >&2
+  exit 1
 fi
 
 echo "Warning: P2P NCCL disaggregated prefill XpYd support for vLLM v1 is experimental and subject to change."
@@ -60,7 +80,7 @@ echo "  Prefill GPUs: $PREFILL_GPUS, Ports: $PREFILL_PORTS"
 echo "  Decode GPUs: $DECODE_GPUS, Ports: $DECODE_PORTS"
 echo "  Proxy Port: $PROXY_PORT"
 echo "  Timeout: ${TIMEOUT_SECONDS}s"
-echo "  Do Profiling: $DO_PROFILING"
+echo "  Log Dir: $RUN_LOG_DIR"
 echo ""
 
 PIDS=()
@@ -90,12 +110,16 @@ ensure_python_library_installed() {
 }
 
 cleanup() {
+    local rc=${1:-0}
     echo "Stopping everything…"
-    trap - INT TERM        # prevent re-entrancy
-    pkill -9 -f "proxy.py"
-    kill -- -$$            # negative PID  ==  "this whole process-group"
-    wait                   # reap children so we don't leave zombies
-    exit 0
+    trap - INT TERM EXIT       # prevent re-entrancy
+    # Delegate to clean.sh (kills vllm/proxy/worker, frees ports, releases GPU,
+    # clears NIXL/UCX shm). Pass every http/proxy port we may have used so it
+    # can free them too.
+    PROXY_PORT=$PROXY_PORT \
+    EXTRA_PORTS="${PREFILL_PORTS//,/ } ${DECODE_PORTS//,/ }" \
+        bash "$SCRIPT_DIR/clean.sh" local || true
+    exit "$rc"
 }
 
 wait_for_server() {
@@ -125,15 +149,20 @@ main() {
     check_num_gpus
     ensure_python_library_installed vllm
 
+    mkdir -p "$RUN_LOG_DIR"
+
     trap cleanup INT
     trap cleanup USR1
     trap cleanup TERM
+    # EXIT trap is a safety net: even if main() returns or dies unexpectedly,
+    # we still try to clean up.
+    trap cleanup EXIT
 
     echo "Launching disaggregated serving components..."
     echo "Please check the log files for detailed output:"
-    echo "  - prefill*.log: Prefill server logs"
-    echo "  - decode*.log: Decode server logs"
-    echo "  - proxy.log: Proxy server log"
+    echo "  - $RUN_LOG_DIR/prefill*.log: Prefill server logs"
+    echo "  - $RUN_LOG_DIR/decode*.log: Decode server logs"
+    echo "  - $RUN_LOG_DIR/proxy.log: Proxy server log"
 
     # Parse GPU and port arrays
     IFS=';' read -ra PREFILL_GPU_ARRAY <<< "$PREFILL_GPUS"
@@ -149,23 +178,26 @@ main() {
     for i in "${!PREFILL_GPU_ARRAY[@]}"; do
         local gpu_ids=${PREFILL_GPU_ARRAY[$i]}
         local port=${PREFILL_PORT_ARRAY[$i]}
-        local kv_port=$((5500 + i))
+        local nixl_port=$((PREFILL_NIXL_PORT + i))
 
-        echo "  Prefill server $((i+1)): GPU $gpu_ids, Port $port, KV Port $kv_port"
+        echo "  Prefill server $((i+1)): GPU $gpu_ids, Port $port, Nixl Port $nixl_port"
+        PYTHONPATH=/workspace/FlowPrefill \
         VLLM_WORKER_MULTIPROC_METHOD=fork \
         VLLM_PROFILER_PATH=$PROFILER \
         CUDA_VISIBLE_DEVICES=$gpu_ids \
-        UCX_NET_DEVICES=all \
+        VLLM_NIXL_SIDE_CHANNEL_PORT=$nixl_port \
+        UCX_TLS=^rc,^ud,^dc,^ib,^rdmacm \
         vllm serve $MODEL \
         --port $port \
         --is-flowprefill \
         --num-runners 128 \
         --tensor-parallel-size $TP_SIZE \
+        --gpu-memory-utilization $PREFILL_MEM_FRACTION_STATIC \
         --max-num-batched-tokens 8192 \
         --no-enable-prefix-caching \
         --enforce-eager \
         --trust-remote-code \
-        --kv-transfer-config "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\", \"kv_port\":\"$kv_port\"}" > ./log/prefill$((i+1)).log 2>&1 &
+        --kv-transfer-config "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\"}" > "$RUN_LOG_DIR/prefill$((i+1)).log" 2>&1 &
         PIDS+=($!)
     done
 
@@ -177,20 +209,23 @@ main() {
     for i in "${!DECODE_GPU_ARRAY[@]}"; do
         local gpu_ids=${DECODE_GPU_ARRAY[$i]}
         local port=${DECODE_PORT_ARRAY[$i]}
-        local kv_port=$((5700 + i))
+        local nixl_port=$((DECODE_NIXL_PORT + i))
 
-        echo "  Decode server $((i+1)): GPU $gpu_ids, Port $port, KV Port $kv_port"
+        echo "  Decode server $((i+1)): GPU $gpu_ids, Port $port, Nixl Port $nixl_port"
+        PYTHONPATH=/workspace/FlowPrefill \
         CUDA_VISIBLE_DEVICES=$gpu_ids \
-        UCX_NET_DEVICES=all \
+        VLLM_NIXL_SIDE_CHANNEL_PORT=$nixl_port \
+        UCX_TLS=^rc,^ud,^dc,^ib,^rdmacm \
         vllm serve $MODEL \
         --port $port \
         --no-is-flowprefill \
         --tensor-parallel-size $TP_SIZE \
+        --gpu-memory-utilization $DECODE_MEM_FRACTION_STATIC \
         --no-enable-prefix-caching \
         --no-enable-chunked-prefill \
         --enforce-eager \
         --trust-remote-code \
-        --kv-transfer-config "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\", \"kv_port\":\"$kv_port\"}" > ./log/decode$((i+1)).log 2>&1 &
+        --kv-transfer-config "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\"}" > "$RUN_LOG_DIR/decode$((i+1)).log" 2>&1 &
         PIDS+=($!)
     done
 
@@ -202,8 +237,7 @@ main() {
     for port in "${PREFILL_PORT_ARRAY[@]}" "${DECODE_PORT_ARRAY[@]}"; do
         if ! wait_for_server $port; then
             echo "Failed to start server on port $port"
-            cleanup
-            exit 1
+            cleanup 1
         fi
     done
 
@@ -214,33 +248,20 @@ main() {
     echo "Starting proxy server on port $PROXY_PORT..."
     python3 proxy.py \
     --port $PROXY_PORT \
-    --prefiller-hosts $(printf 'localhost %.0s' "${PREFILL_PORT_ARRAY[@]}") \
+    --prefiller-hosts $(printf '0.0.0.0 %.0s' "${PREFILL_PORT_ARRAY[@]}") \
     --prefiller-ports "${PREFILL_PORT_ARRAY[@]}" \
-    --decoder-hosts $(printf 'localhost %.0s' "${DECODE_PORT_ARRAY[@]}") \
-    --decoder-ports "${DECODE_PORT_ARRAY[@]}" &
+    --decoder-hosts $(printf '0.0.0.0 %.0s' "${DECODE_PORT_ARRAY[@]}") \
+    --decoder-ports "${DECODE_PORT_ARRAY[@]}" > "$RUN_LOG_DIR/proxy.log" 2>&1 &
     PROXY_PID=$!
     PIDS+=($PROXY_PID)
-    # PIDS+=($!)
-
-    # =============================================================================
-    # Profiling
-    # =============================================================================
-    if [ "$DO_PROFILING" -eq 1 ]; then
-        python ./profiler/profiling_online.py \
-            --model $MODEL \
-            --tp-size $TP_SIZE
-        echo "Profiling done. Cleaning up..."
-        cleanup
 
     # =============================================================================
     # Start serving
     # =============================================================================
-    else
-        echo ""
-        echo "All servers are up. Starting serving..."
-        wait $PROXY_PID
-        cleanup
-    fi
+    echo ""
+    echo "All servers are up. Starting serving..."
+    wait $PROXY_PID
+    cleanup
 }
 
 main

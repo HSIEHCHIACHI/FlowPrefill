@@ -2,12 +2,8 @@ import argparse
 import asyncio
 import matplotlib.pyplot as plt
 import numpy as np
-import os
-import re
 import time
-import torch
 
-from vllm.config import KVTransferConfig
 from vllm import AsyncEngineArgs, AsyncLLMEngine
 from vllm import SamplingParams
 from pathlib import Path
@@ -94,21 +90,21 @@ async def fitting_and_plot(input_len_list, tp_size, model):
     # plotting
     plt.figure(figsize=(8, 5))
     plt.plot(x_fit, y_fit, label='poly', color='red')
-    # plt.scatter(x, y, label='原始数据', color='blue')
+    # plt.scatter(x, y, label='original data', color='blue')
     plt.scatter(x_clean, y_clean, label='data', color='blue')
     plt.xlabel('Input length (token)')
     plt.ylabel('TTFT (s)')
     plt.legend()
     plt.grid(True)
-    plt.savefig(BASE_DIR / f"plotting_{model.split('/')[-1]}_tp{tp_size}_offline.png", bbox_inches='tight')
+    plt.savefig(BASE_DIR / f"plotting_{model.split('/')[-1]}_tp{tp_size}.png", bbox_inches='tight')
     plt.show()
 
-    np.save(BASE_DIR / f"profile_{model.split('/')[-1]}_tp{tp_size}_offline.npy", y_fit)
-    print(f"profile_{model.split('/')[-1]}_tp{tp_size}_offline.npy have been save")
+    np.save(BASE_DIR / f"profile_{model.split('/')[-1]}_tp{tp_size}.npy", y_fit)
+    print(f"profile_{model.split('/')[-1]}_tp{tp_size}.npy have been save")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-14B-Instruct")
     parser.add_argument("--tp-size", type=int, default=1)
     args = parser.parse_args()
 
@@ -127,12 +123,6 @@ if __name__ == "__main__":
             "tensor_parallel_size": args.tp_size,
             "enable_chunked_prefill": True,
             "enable_prefix_caching": False,
-
-            # "kv_transfer_config": KVTransferConfig(
-            #     kv_connector="NixlConnector",
-            #     kv_role="kv_both",
-            #     kv_port="5601",
-            # ),
         }
     engine_arg = AsyncEngineArgs(**params)
     asyllm = AsyncLLMEngine.from_engine_args(engine_arg)

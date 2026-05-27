@@ -58,9 +58,11 @@ def extract_datasets(dataset, lower, upper):
         if  t >= 60*lower and t <= 60*upper:
             new_data.append(req_dict)
 
-    with open(BASE_DIR / f"qwen_traceA_{lower}min_{upper}min.jsonl", "w", encoding="utf-8") as f:
+    output_path = BASE_DIR / f"qwen_traceA_{lower}min_{upper}min.jsonl"
+    with open(output_path, "w", encoding="utf-8") as f:
         for r in new_data:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    print(f"The trace file is saved in {output_path}")
 
 def sample_reqs(trace_path, slo_dict):
     with open(trace_path, "r") as f:

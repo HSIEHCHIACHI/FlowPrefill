@@ -585,10 +585,6 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
 
     return module
 
-def execution_record(ctx):
-    if ctx and ctx.preempted_signal is not None:
-        ctx.execution_signal.clear()
-
 def preemption_check(ctx):
     if ctx is not None:
         ctx.compute_stream.synchronize()
@@ -601,16 +597,17 @@ def preemption_check(ctx):
             ctx.ckpt_epochs[rank].value+=1
             with ctx.nccl_lock:
                 if not ctx.preempted_signal.is_set():
-                    ctx.sync_ckpt.value = ctx.ckpt_epochs[rank].value+1 # tp_checkpoint
+                    tp_counter = max([ckpt_epoch.value for ckpt_epoch in ctx.ckpt_epochs])
+                    ctx.sync_ckpt.value = tp_counter + 1 # next sync_ckpt
                     ctx.preempted_signal.set() # notifying just one of the ranks will suffice
-                    ctx.tp_signal.clear() # tp_signal
             if ctx.ckpt_epochs[rank].value == ctx.sync_ckpt.value:
                 tp_group.barrier()
-                ctx.execution_signal.set() # operator completion, send ACK
-                ctx.tp_signal.wait()
+                ctx.tp_signal.set() # operator completion, send ACK
+                ctx.execution_signal.wait() # wait for recover
         else:
-            ctx.execution_signal.set() # operator completion, send ACK
-            ctx.preempted_signal.wait()
+            if not ctx.preempted_signal.is_set():
+                ctx.preempted_signal.set() # operator completion, send ACK
+                ctx.execution_signal.wait() # wait for recover
 
 def make_layers(
     num_hidden_layers: int,
