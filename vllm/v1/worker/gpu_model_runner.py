@@ -2968,7 +2968,8 @@ class GPUModelRunner(
             self.calculate_kv_scales = False
 
         if ack_runner_id is not None: # async schedule
-            self.ack_signals[ack_runner_id].wait() # wait for preemption done
+            # Wait for the preemption ACK from the previous woker thread
+            self.ack_signals[ack_runner_id].wait()
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.

@@ -665,7 +665,7 @@ class EngineCore:
                     runner_id = self.executing_req.runner_id
                     with self.resource_lock:
                         if not self.executing_req.is_finished():
-                            self.execution_signals[runner_id].clear() # recover signal
+                            self.execution_signals[runner_id].clear() # suspend execution
                             self.preempted_signals[runner_id].clear()
                             if self.tp_size > 1:
                                 self.tp_signals[runner_id].clear()
@@ -692,6 +692,8 @@ class EngineCore:
                         self.tp_signals[new_runner_id].set() # for tp preemption
 
                     H_priority_req.runner_id = new_runner_id
+                    # Non-blocking execution, waiting ACK logic is in 
+                    # func _execute_model_impl from gpu_model_runner.py
                     self.execution_pool.submit(
                         self.prefill_step, H_priority_req, slo_batch, self.ack_runner_id)
                     for req in slo_batch:
@@ -701,7 +703,7 @@ class EngineCore:
                     # Record execution start timestamp
                     H_priority_req.start_timestamp = time.perf_counter()
                 else: # elif H_priority_req in self.running:
-                    self.execution_signals[H_priority_req.runner_id].set() # recover request
+                    self.execution_signals[H_priority_req.runner_id].set() # resume execution
                     # Reset start timestamp, last execution time span has been recorded
                     H_priority_req.start_timestamp = time.perf_counter()
 

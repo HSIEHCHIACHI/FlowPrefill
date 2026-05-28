@@ -603,11 +603,11 @@ def preemption_check(ctx):
             if ctx.ckpt_epochs[rank].value == ctx.sync_ckpt.value:
                 tp_group.barrier()
                 ctx.tp_signal.set() # operator completion, send ACK
-                ctx.execution_signal.wait() # wait for recover
+                ctx.execution_signal.wait() # wait for resumption
         else:
             if not ctx.preempted_signal.is_set():
                 ctx.preempted_signal.set() # operator completion, send ACK
-                ctx.execution_signal.wait() # wait for recover
+                ctx.execution_signal.wait() # wait for resumption
 
 def make_layers(
     num_hidden_layers: int,
