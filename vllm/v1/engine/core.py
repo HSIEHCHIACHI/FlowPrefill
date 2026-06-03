@@ -67,9 +67,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
 
 import threading
-from vllm.utils.async_utils import make_async
 from concurrent.futures import ThreadPoolExecutor
-import numpy as np
 import multiprocessing as mp
 import math
 from collections import defaultdict
@@ -243,7 +241,7 @@ class EngineCore:
                 self.execution_signals[runner_id] = mp.Event()
                 self.ckpt_epochs[runner_id] = [mp.Value('i', 0) for _ in range(self.tp_size)]
                 self.tp_signals[runner_id] = mp.Event()
-                self.sync_ckpts[runner_id] = mp.Value('i', 0)
+                self.sync_ckpts[runner_id] = mp.Value('i', -1)
             else:
                 self.preempted_signals[runner_id] = threading.Event()
                 self.execution_signals[runner_id] = threading.Event()
@@ -478,7 +476,7 @@ class EngineCore:
             engine_core_outputs = self.scheduler.update_from_output(
                 scheduler_output, model_output)  # add finished_req_ids in scheduler
         return engine_core_outputs, scheduler_output
-    
+
     # A complete prefill execution
     def prefill_step(
         self,
@@ -604,6 +602,7 @@ class EngineCore:
                     self.tp_signals[self.ack_runner_id].wait() # wait for ACK
                 else:
                     self.preempted_signals[self.ack_runner_id].wait() # wait for ACK
+                self.ack_runner_id = None # ACK done
 
             self.free_kv_xfer_blocks() # clean trasfer status
             reqs = self.running + self.waiting
@@ -669,15 +668,13 @@ class EngineCore:
                             self.preempted_signals[runner_id].clear()
                             if self.tp_size > 1:
                                 self.tp_signals[runner_id].clear()
-                    self.ack_runner_id = runner_id
+                            self.ack_runner_id = runner_id
                     # Update execution time, for priority sorting
                     with self.sort_lock:
                         self.executing_req.update_execution_time()
                     if self.is_logger:
                         logger.info(f"req {self.executing_req.request_id} have been "
                                     f"preempted by req {H_priority_req.request_id}")
-                else: # No preemption
-                    self.ack_runner_id = None
 
                 if H_stats: # if slo_batch:
                     with self.resource_lock:

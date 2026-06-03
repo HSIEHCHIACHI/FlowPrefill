@@ -590,7 +590,6 @@ def preemption_check(ctx):
         ctx.compute_stream.synchronize()
 
     if ctx is not None and ctx.preempted_signal is not None:
-        # ctx.compute_stream.synchronize()
         tp_group = get_tp_group()
         if tp_group.world_size > 1:
             rank = tp_group.rank
