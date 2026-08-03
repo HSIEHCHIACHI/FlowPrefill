@@ -174,7 +174,11 @@ async def send_request_to_service(
 
 
 async def stream_service_response(
-    client_info: dict, endpoint: str, req_data: dict, request_id: str
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    skip_first_data_event: bool = False,
 ):
     """
     Asynchronously stream response from a service using a client from the pool.
@@ -188,13 +192,53 @@ async def stream_service_response(
         "POST", endpoint, json=req_data, headers=headers
     ) as response:
         response.raise_for_status()
-        async for chunk in response.aiter_bytes():
-            yield chunk
+        event_lines: list[str] = []
+        skipped_first_data_event = False
+        async for line in response.aiter_lines():
+            if line:
+                event_lines.append(line)
+                continue
+
+            if not event_lines:
+                continue
+            event = "\n".join(event_lines)
+            event_lines.clear()
+            has_data = any(
+                event_line.startswith("data:")
+                and event_line[5:].strip() not in {"", "[DONE]"}
+                for event_line in event.splitlines()
+            )
+            if (
+                skip_first_data_event
+                and not skipped_first_data_event
+                and has_data
+            ):
+                skipped_first_data_event = True
+                continue
+            yield f"{event}\n\n"
+
+        if event_lines:
+            event = "\n".join(event_lines)
+            has_data = any(
+                event_line.startswith("data:")
+                and event_line[5:].strip() not in {"", "[DONE]"}
+                for event_line in event.splitlines()
+            )
+            if not (
+                skip_first_data_event
+                and not skipped_first_data_event
+                and has_data
+            ):
+                yield f"{event}\n\n"
 
 async def _handle_completions(api: str, request: Request):
     try:
         req_data = await request.json()
-        request_id = str(uuid.uuid4())
+        request_id = str(
+            req_data.get("request_id")
+            or request.headers.get("X-Request-Id")
+            or uuid.uuid4()
+        )
 
         # Get the next prefill client in round-robin fashion
         prefill_client_info = get_next_client(request.app, "prefill")
@@ -236,16 +280,13 @@ async def _handle_completions(api: str, request: Request):
             yield f"data: {json.dumps(first_chunk)}\n\n"
 
             # decode
-            first_decode_token_skipped = False
             async for chunk in stream_service_response(
-                decode_client_info, api, req_data, request_id=request_id
+                decode_client_info,
+                api,
+                req_data,
+                request_id=request_id,
+                skip_first_data_event=True,
             ):
-                text = chunk.decode("utf-8")
-                # Skip the acutal first decode token chunk
-                if not first_decode_token_skipped:
-                    # if '"delta"' in text and 'content:""' not in text:
-                    first_decode_token_skipped = True
-                    continue
                 yield chunk
 
         # return StreamingResponse(generate_stream(), media_type="text/event-stream")

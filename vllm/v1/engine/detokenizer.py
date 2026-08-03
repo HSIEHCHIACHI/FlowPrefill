@@ -181,8 +181,8 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
         # Find a safe place to start.
         prompt_token_ids = request.prompt_token_ids or []
-        prompt_suffix = prompt_token_ids
-        prompt_len = len(prompt_suffix)
+        prompt_len = len(prompt_token_ids)
+        prompt_suffix = prompt_token_ids[-min(prompt_len, 23) :]
         if prompt_len > 4:
             for i in range(4, min(prompt_len + 1, 24)):
                 suffix = prompt_token_ids[-i:]

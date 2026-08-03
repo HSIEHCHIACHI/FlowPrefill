@@ -372,6 +372,7 @@ class Qwen2Model(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
+        self.is_flowprefill = vllm_config.model_config.is_flowprefill
 
         if get_pp_group().is_first_rank or (
             config.tie_word_embeddings and get_pp_group().is_last_rank
@@ -418,7 +419,7 @@ class Qwen2Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        ctx = get_forward_context()
+        ctx = get_forward_context() if self.is_flowprefill else None
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds

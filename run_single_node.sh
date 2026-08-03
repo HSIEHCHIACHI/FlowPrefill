@@ -33,6 +33,8 @@
 # Configuration - can be overridden via environment variables
 MODEL=${MODEL:-Qwen/Qwen2.5-14B-Instruct}
 TP_SIZE=${TP_SIZE:-2}
+WORKER_MULTIPROC_METHOD=${WORKER_MULTIPROC_METHOD:-spawn}
+NCCL_SOCKET_IFNAME_SINGLE_NODE=${NCCL_SOCKET_IFNAME_SINGLE_NODE:-lo}
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 MODEL_NAME="$(basename -- "$MODEL")"
@@ -181,10 +183,11 @@ main() {
         local nixl_port=$((PREFILL_NIXL_PORT + i))
 
         echo "  Prefill server $((i+1)): GPU $gpu_ids, Port $port, Nixl Port $nixl_port"
-        PYTHONPATH=/workspace/FlowPrefill \
-        VLLM_WORKER_MULTIPROC_METHOD=fork \
+        PYTHONPATH="$SCRIPT_DIR" \
+        VLLM_WORKER_MULTIPROC_METHOD="$WORKER_MULTIPROC_METHOD" \
         VLLM_PROFILER_PATH=$PROFILER \
         CUDA_VISIBLE_DEVICES=$gpu_ids \
+        NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME_SINGLE_NODE \
         VLLM_NIXL_SIDE_CHANNEL_PORT=$nixl_port \
         UCX_TLS=^rc,^ud,^dc,^ib,^rdmacm \
         vllm serve $MODEL \
@@ -212,8 +215,10 @@ main() {
         local nixl_port=$((DECODE_NIXL_PORT + i))
 
         echo "  Decode server $((i+1)): GPU $gpu_ids, Port $port, Nixl Port $nixl_port"
-        PYTHONPATH=/workspace/FlowPrefill \
+        PYTHONPATH="$SCRIPT_DIR" \
+        VLLM_WORKER_MULTIPROC_METHOD="$WORKER_MULTIPROC_METHOD" \
         CUDA_VISIBLE_DEVICES=$gpu_ids \
+        NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME_SINGLE_NODE \
         VLLM_NIXL_SIDE_CHANNEL_PORT=$nixl_port \
         UCX_TLS=^rc,^ud,^dc,^ib,^rdmacm \
         vllm serve $MODEL \

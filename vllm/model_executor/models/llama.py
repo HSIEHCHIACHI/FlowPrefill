@@ -408,6 +408,7 @@ class LlamaModel(nn.Module):
 
         self.config = config
         self.quant_config = quant_config
+        self.is_flowprefill = vllm_config.model_config.is_flowprefill
 
         self.vocab_size = config.vocab_size
 
@@ -448,7 +449,7 @@ class LlamaModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        ctx = get_forward_context()
+        ctx = get_forward_context() if self.is_flowprefill else None
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds

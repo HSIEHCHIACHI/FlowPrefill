@@ -58,6 +58,15 @@ import itertools
 
 logger = init_logger(__name__)
 
+_LEGACY_SHARED_CONFIG_FIELDS = (
+    "preempted_signals",
+    "execution_signals",
+    "ckpt_epochs",
+    "nccl_lock",
+    "sync_ckpts",
+    "tp_signals",
+)
+
 
 class MultiprocExecutor(Executor):
     """
@@ -180,6 +189,14 @@ class MultiprocExecutor(Executor):
         # Create workers
         context = get_mp_context()
         shared_worker_lock = context.Lock()
+        parallel_config = self.vllm_config.parallel_config
+        legacy_shared_state = {
+            field: getattr(parallel_config, field)
+            for field in _LEGACY_SHARED_CONFIG_FIELDS
+            if getattr(parallel_config, field, None) is not None
+        }
+        for field in legacy_shared_state:
+            setattr(parallel_config, field, None)
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False
         try:
@@ -192,6 +209,7 @@ class MultiprocExecutor(Executor):
                         distributed_init_method=distributed_init_method,
                         input_shm_handle=scheduler_output_handle,
                         shared_worker_lock=shared_worker_lock,
+                        legacy_shared_state=legacy_shared_state,
                     ))
 
             # Workers must be created before wait_for_ready to avoid deadlock
@@ -217,6 +235,8 @@ class MultiprocExecutor(Executor):
 
             success = True
         finally:
+            for field, value in legacy_shared_state.items():
+                setattr(parallel_config, field, value)
             if not success:
                 # stop sender to avoid leaking thread / writing to half-initialized MQ
                 try:
@@ -578,6 +598,7 @@ class WorkerProc:
         distributed_init_method: str,
         input_shm_handle: Handle,
         shared_worker_lock: LockType,
+        legacy_shared_state: dict[str, Any] | None = None,
     ):
         self.rank = rank
         wrapper = WorkerWrapperBase(vllm_config=vllm_config, rpc_rank=rank)
@@ -637,6 +658,7 @@ class WorkerProc:
         distributed_init_method: str,
         input_shm_handle,  # Receive SchedulerOutput
         shared_worker_lock: LockType,
+        legacy_shared_state: dict[str, Any] | None = None,
     ) -> UnreadyWorkerProcHandle:
         context = get_mp_context()
         # (reader, writer)
@@ -654,6 +676,7 @@ class WorkerProc:
             "ready_pipe": (reader, writer),
             "death_pipe": death_reader,
             "shared_worker_lock": shared_worker_lock,
+            "legacy_shared_state": legacy_shared_state,
         }
         proc = context.Process(
             target=WorkerProc.worker_main,
@@ -746,6 +769,11 @@ class WorkerProc:
 
         try:
             reader.close()
+            legacy_shared_state = kwargs.pop("legacy_shared_state", None)
+            if legacy_shared_state:
+                parallel_config = kwargs["vllm_config"].parallel_config
+                for field, value in legacy_shared_state.items():
+                    setattr(parallel_config, field, value)
             worker = WorkerProc(*args, **kwargs)
 
             ready_writer.send(
